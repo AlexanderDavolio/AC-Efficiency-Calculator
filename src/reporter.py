@@ -1,0 +1,183 @@
+"""Output layer: per-site cleaned CSVs and a single multi-tab Excel report."""
+
+import calendar
+import os
+from pathlib import Path
+from typing import List
+
+import pandas as pd
+
+from src.models import SiteRecord
+from src import config
+
+
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _autofit_columns(worksheet) -> None:
+    """Set each column width to the longest value in that column plus padding."""
+    for col in worksheet.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        worksheet.column_dimensions[col[0].column_letter].width = max_len + 2
+
+
+def _write_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str) -> None:
+    """Write df to a named sheet and auto-fit its column widths."""
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+    _autofit_columns(writer.sheets[sheet_name])
+
+
+# ── Per-site summaries ────────────────────────────────────────────────────────
+
+def summarise_site(record: SiteRecord) -> dict:
+    """Return a summary dict of key metrics for one site using its enriched_df."""
+    df = record.enriched_df
+    ts = df[config.COL_TIMESTAMP]
+
+    summary = {
+        "site_name":          record.site_id,
+        "total_raw_rows":     len(record.raw_df),
+        "clean_rows":         len(df),
+        "clean_row_pct":      round(len(df) / len(record.raw_df) * 100, 2),
+        "avg_efficiency_pct": round(df[config.COL_EFFICIENCY_PCT].mean(), 3),
+        "min_efficiency_pct": round(df[config.COL_EFFICIENCY_PCT].min(), 3),
+        "max_efficiency_pct": round(df[config.COL_EFFICIENCY_PCT].max(), 3),
+        "avg_loss_delta_kw":  round(df[config.COL_LOSS_DELTA_KW].mean(), 3),
+        "date_range_start":   ts.min().date() if not ts.empty else None,
+        "date_range_end":     ts.max().date() if not ts.empty else None,
+    }
+
+    record.summary = summary
+    return summary
+
+
+def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
+    """Return a DataFrame with one row per month of aggregated efficiency metrics."""
+    df = record.enriched_df
+
+    agg = (
+        df.groupby(config.COL_MONTH)
+        .agg(
+            row_count=(config.COL_EFFICIENCY_PCT, "count"),
+            avg_efficiency_pct=(config.COL_EFFICIENCY_PCT, "mean"),
+            min_efficiency_pct=(config.COL_EFFICIENCY_PCT, "min"),
+            max_efficiency_pct=(config.COL_EFFICIENCY_PCT, "max"),
+            avg_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "mean"),
+        )
+        .reset_index()
+        .rename(columns={config.COL_MONTH: "month"})
+    )
+
+    agg["month"] = agg["month"].astype(int)
+    agg["month_name"] = agg["month"].apply(lambda m: calendar.month_name[m])
+    agg["site_name"] = record.site_id
+
+    # Round float columns for readability.
+    float_cols = ["avg_efficiency_pct", "min_efficiency_pct", "max_efficiency_pct", "avg_loss_delta_kw"]
+    agg[float_cols] = agg[float_cols].round(3)
+
+    return agg[["site_name", "month", "month_name", "row_count",
+                "avg_efficiency_pct", "min_efficiency_pct", "max_efficiency_pct",
+                "avg_loss_delta_kw"]]
+
+
+def summarise_by_time_bucket(record: SiteRecord) -> pd.DataFrame:
+    """Return a DataFrame with one row per time bucket (excluding 'Other')."""
+    df = record.enriched_df
+    df = df[df[config.COL_TIME_BUCKET] != "Other"]
+
+    agg = (
+        df.groupby(config.COL_TIME_BUCKET)
+        .agg(
+            row_count=(config.COL_EFFICIENCY_PCT, "count"),
+            avg_efficiency_pct=(config.COL_EFFICIENCY_PCT, "mean"),
+            avg_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "mean"),
+        )
+        .reset_index()
+        .rename(columns={config.COL_TIME_BUCKET: "time_bucket"})
+    )
+
+    agg["site_name"] = record.site_id
+
+    float_cols = ["avg_efficiency_pct", "avg_loss_delta_kw"]
+    agg[float_cols] = agg[float_cols].round(3)
+
+    # Preserve natural time-of-day order rather than alphabetical.
+    bucket_order = ["Morning", "Peak", "Afternoon"]
+    agg["time_bucket"] = pd.Categorical(agg["time_bucket"], categories=bucket_order, ordered=True)
+    agg = agg.sort_values("time_bucket").reset_index(drop=True)
+
+    return agg[["site_name", "time_bucket", "row_count", "avg_efficiency_pct", "avg_loss_delta_kw"]]
+
+
+def summarise_inverters(record: SiteRecord) -> dict:
+    """Return a dict of inverter contribution metrics for one site."""
+    df = record.enriched_df
+
+    # Only include rows where inverter total is positive to avoid division by zero.
+    valid = df[df[config.COL_TOTAL_INVERTER_KW] > 0]
+
+    inv1_share = (valid[config.COL_INV1_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100)
+    inv2_share = (valid[config.COL_INV2_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100)
+
+    return {
+        "site_name":         record.site_id,
+        "inv1_avg_share_pct": round(inv1_share.mean(), 3),
+        "inv2_avg_share_pct": round(inv2_share.mean(), 3),
+        "inv1_avg_kw":        round(valid[config.COL_INV1_AC_KW].mean(), 3),
+        "inv2_avg_kw":        round(valid[config.COL_INV2_AC_KW].mean(), 3),
+    }
+
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+
+def write_cleaned_csv(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path:
+    """Write enriched_df to output/<site_id>_cleaned.csv and return the path."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{record.site_id}_cleaned.csv"
+    record.enriched_df.to_csv(path, index=False)
+    print(f"[reporter] wrote cleaned CSV   : {path}")
+    return path
+
+
+def build_comparison_table(records: List[SiteRecord]) -> pd.DataFrame:
+    """Collect per-site summaries and return a DataFrame sorted by avg efficiency."""
+    rows = [r.summary if r.summary else summarise_site(r) for r in records]
+    df = pd.DataFrame(rows).sort_values("avg_efficiency_pct", ascending=False)
+    return df.reset_index(drop=True)
+
+
+# ── Excel output ─────────────────────────────────────────────────────────────
+
+def write_excel_report(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) -> Path:
+    """Write a single Excel file with Summary, Monthly, Time of Day, and Inverter Split tabs."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "efficiency_report.xlsx"
+
+    summary_df    = build_comparison_table(records)
+    monthly_df    = pd.concat([summarise_by_month(r) for r in records], ignore_index=True)
+    time_of_day_df = pd.concat([summarise_by_time_bucket(r) for r in records], ignore_index=True)
+    inverter_df   = pd.DataFrame([summarise_inverters(r) for r in records])
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        _write_sheet(writer, summary_df,     "Summary")
+        _write_sheet(writer, monthly_df,     "Monthly")
+        _write_sheet(writer, time_of_day_df, "Time of Day")
+        _write_sheet(writer, inverter_df,    "Inverter Split")
+
+    print(f"[reporter] wrote Excel report  : {path}")
+    os.startfile(path)
+    return path
+
+
+# ── Orchestrator ──────────────────────────────────────────────────────────────
+
+def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) -> None:
+    """Write per-site cleaned CSVs and the multi-tab Excel report."""
+    for r in records:
+        summarise_site(r)
+        write_cleaned_csv(r, output_dir)
+
+    write_excel_report(records, output_dir)
