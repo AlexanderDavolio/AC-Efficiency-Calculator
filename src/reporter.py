@@ -24,9 +24,11 @@ def _autofit_columns(worksheet) -> None:
 
 
 def _write_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str) -> None:
-    """Write df to a named sheet and auto-fit its column widths."""
+    """Write df to a named sheet, auto-fit column widths, and freeze the header row."""
     df.to_excel(writer, sheet_name=sheet_name, index=False)
-    _autofit_columns(writer.sheets[sheet_name])
+    ws = writer.sheets[sheet_name]
+    _autofit_columns(ws)
+    ws.freeze_panes = "A2"
 
 
 # ── Per-site summaries ────────────────────────────────────────────────────────
@@ -54,33 +56,45 @@ def summarise_site(record: SiteRecord) -> dict:
 
 
 def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
-    """Return a DataFrame with one row per month of aggregated efficiency metrics."""
-    df = record.enriched_df
+    """Return a DataFrame with one row per (year, month) with display-ready column names."""
+    df = record.enriched_df.copy()
+    ts = pd.to_datetime(df[config.COL_TIMESTAMP])
+    df["_year"]  = ts.dt.year
+    df["_month"] = ts.dt.month
 
     agg = (
-        df.groupby(config.COL_MONTH)
+        df.groupby(["_year", "_month"])
         .agg(
             row_count=(config.COL_EFFICIENCY_PCT, "count"),
             avg_efficiency_pct=(config.COL_EFFICIENCY_PCT, "mean"),
             min_efficiency_pct=(config.COL_EFFICIENCY_PCT, "min"),
             max_efficiency_pct=(config.COL_EFFICIENCY_PCT, "max"),
             avg_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "mean"),
+            total_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "sum"),
         )
         .reset_index()
-        .rename(columns={config.COL_MONTH: "month"})
+        .sort_values(["_year", "_month"])
+        .reset_index(drop=True)
     )
 
-    agg["month"] = agg["month"].astype(int)
-    agg["month_name"] = agg["month"].apply(lambda m: calendar.month_name[m])
-    agg["site_name"] = record.site_id
-
-    # Round float columns for readability.
-    float_cols = ["avg_efficiency_pct", "min_efficiency_pct", "max_efficiency_pct", "avg_loss_delta_kw"]
+    float_cols = ["avg_efficiency_pct", "min_efficiency_pct", "max_efficiency_pct",
+                  "avg_loss_delta_kw", "total_loss_delta_kw"]
     agg[float_cols] = agg[float_cols].round(3)
 
-    return agg[["site_name", "month", "month_name", "row_count",
-                "avg_efficiency_pct", "min_efficiency_pct", "max_efficiency_pct",
-                "avg_loss_delta_kw"]]
+    month_labels = agg.apply(
+        lambda r: f"{calendar.month_abbr[int(r['_month'])]} {int(r['_year'])}", axis=1
+    )
+
+    return pd.DataFrame({
+        "Site":                    record.site_id,
+        "Month":                   month_labels,
+        "Valid Readings":          agg["row_count"],
+        "Average Efficiency (%)":  agg["avg_efficiency_pct"],
+        "Min Efficiency (%)":      agg["min_efficiency_pct"],
+        "Max Efficiency (%)":      agg["max_efficiency_pct"],
+        "Average Power Loss (kW)": agg["avg_loss_delta_kw"],
+        "Total Power Loss (kW)":   agg["total_loss_delta_kw"],
+    })
 
 
 def summarise_by_time_bucket(record: SiteRecord) -> pd.DataFrame:
@@ -99,35 +113,44 @@ def summarise_by_time_bucket(record: SiteRecord) -> pd.DataFrame:
         .rename(columns={config.COL_TIME_BUCKET: "time_bucket"})
     )
 
-    agg["site_name"] = record.site_id
-
     float_cols = ["avg_efficiency_pct", "avg_loss_delta_kw"]
     agg[float_cols] = agg[float_cols].round(3)
 
-    # Preserve natural time-of-day order rather than alphabetical.
+    # Sort into natural time-of-day order before remapping labels.
     bucket_order = ["Morning", "Peak", "Afternoon"]
     agg["time_bucket"] = pd.Categorical(agg["time_bucket"], categories=bucket_order, ordered=True)
     agg = agg.sort_values("time_bucket").reset_index(drop=True)
 
-    return agg[["site_name", "time_bucket", "row_count", "avg_efficiency_pct", "avg_loss_delta_kw"]]
+    label_map = {
+        "Morning":   "Morning (6am–9am)",
+        "Peak":      "Peak (10am–1pm)",
+        "Afternoon": "Afternoon (2pm–5pm)",
+    }
+    agg["time_bucket"] = agg["time_bucket"].map(label_map)
+
+    return pd.DataFrame({
+        "Site":                    record.site_id,
+        "Time Period":             agg["time_bucket"],
+        "Valid Readings":          agg["row_count"],
+        "Average Efficiency (%)":  agg["avg_efficiency_pct"],
+        "Average Power Loss (kW)": agg["avg_loss_delta_kw"],
+    })
 
 
 def summarise_inverters(record: SiteRecord) -> dict:
-    """Return a dict of inverter contribution metrics for one site."""
+    """Return a dict of inverter power share metrics with an imbalance note."""
     df = record.enriched_df
-
-    # Only include rows where inverter total is positive to avoid division by zero.
     valid = df[df[config.COL_TOTAL_INVERTER_KW] > 0]
 
-    inv1_share = (valid[config.COL_INV1_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100)
-    inv2_share = (valid[config.COL_INV2_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100)
+    inv1_share = round((valid[config.COL_INV1_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100).mean(), 3)
+    inv2_share = round((valid[config.COL_INV2_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100).mean(), 3)
+    balanced = (45 <= inv1_share <= 55) and (45 <= inv2_share <= 55)
 
     return {
-        "site_name":         record.site_id,
-        "inv1_avg_share_pct": round(inv1_share.mean(), 3),
-        "inv2_avg_share_pct": round(inv2_share.mean(), 3),
-        "inv1_avg_kw":        round(valid[config.COL_INV1_AC_KW].mean(), 3),
-        "inv2_avg_kw":        round(valid[config.COL_INV2_AC_KW].mean(), 3),
+        "Site":                       record.site_id,
+        "Inverter 1 Power Share (%)": inv1_share,
+        "Inverter 2 Power Share (%)": inv2_share,
+        "Notes":                      "" if balanced else "Imbalance detected",
     }
 
 
@@ -142,28 +165,19 @@ def write_cleaned_csv(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path
     return path
 
 
-def build_comparison_table(records: List[SiteRecord]) -> pd.DataFrame:
-    """Collect per-site summaries and return a DataFrame sorted by avg efficiency."""
-    rows = [r.summary if r.summary else summarise_site(r) for r in records]
-    df = pd.DataFrame(rows).sort_values("avg_efficiency_pct", ascending=False)
-    return df.reset_index(drop=True)
-
-
 # ── Excel output ─────────────────────────────────────────────────────────────
 
 def write_excel_report(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) -> Path:
-    """Write a single Excel file with Summary, Monthly, Time of Day, and Inverter Split tabs."""
+    """Write a single Excel file with Monthly Breakdown, Time of Day, and Inverter Split tabs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "efficiency_report.xlsx"
 
-    summary_df    = build_comparison_table(records)
-    monthly_df    = pd.concat([summarise_by_month(r) for r in records], ignore_index=True)
+    monthly_df     = pd.concat([summarise_by_month(r)       for r in records], ignore_index=True)
     time_of_day_df = pd.concat([summarise_by_time_bucket(r) for r in records], ignore_index=True)
-    inverter_df   = pd.DataFrame([summarise_inverters(r) for r in records])
+    inverter_df    = pd.DataFrame([summarise_inverters(r)   for r in records])
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        _write_sheet(writer, summary_df,     "Summary")
-        _write_sheet(writer, monthly_df,     "Monthly")
+        _write_sheet(writer, monthly_df,     "Monthly Breakdown")
         _write_sheet(writer, time_of_day_df, "Time of Day")
         _write_sheet(writer, inverter_df,    "Inverter Split")
 

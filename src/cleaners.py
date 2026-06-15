@@ -34,27 +34,41 @@ def filter_offline(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def filter_phase_imbalance(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows where the spread across the three AC phase currents exceeds the threshold.
+def _imbalance_flagged(df: pd.DataFrame, cols, threshold: float) -> pd.Series:
+    """Return a boolean Series: True where (max-min)/mean exceeds threshold.
 
-    Ratio = (max - min) / mean across columns A, B, C for each row.
-    Rows where mean is 0 (all phases zero) produce NaN and are kept — they were
-    already caught by filter_offline.
+    Rows where mean is 0 produce NaN (division guard) and are treated as not-flagged —
+    they will have been caught by filter_offline or filter_nighttime first.
+    """
+    vals = df[cols]
+    mean = vals.mean(axis=1)
+    ratio = (vals.max(axis=1) - vals.min(axis=1)) / mean.where(mean != 0)
+    return (ratio > threshold).fillna(False)
+
+
+def filter_phase_imbalance(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows where any signal group exceeds its imbalance ratio threshold.
+
+    Three groups are checked independently, each with its own threshold:
+      - Phase currents  (A, B, C)   — config.CURRENT_IMBALANCE_THRESHOLD
+      - Phase voltages  (AN, BN, CN) — config.VOLTAGE_IMBALANCE_THRESHOLD
+      - Inverter outputs (1, 2)      — config.INVERTER_IMBALANCE_THRESHOLD
+    A row is dropped if flagged by any group; the console line shows per-group counts.
     """
     before = len(df)
-    phases = df[[config.COL_CURRENT_A, config.COL_CURRENT_B, config.COL_CURRENT_C]]
-    phase_max = phases.max(axis=1)
-    phase_min = phases.min(axis=1)
-    phase_mean = phases.mean(axis=1)
 
-    # Replace zero mean with NaN so division doesn't produce inf.
-    ratio = (phase_max - phase_min) / phase_mean.where(phase_mean != 0)
+    current_flag  = _imbalance_flagged(df, [config.COL_CURRENT_A, config.COL_CURRENT_B, config.COL_CURRENT_C], config.CURRENT_IMBALANCE_THRESHOLD)
+    voltage_flag  = _imbalance_flagged(df, [config.COL_VOLTAGE_A, config.COL_VOLTAGE_B, config.COL_VOLTAGE_C], config.VOLTAGE_IMBALANCE_THRESHOLD)
+    inverter_flag = _imbalance_flagged(df, [config.COL_INV1_AC_KW, config.COL_INV2_AC_KW],                     config.INVERTER_IMBALANCE_THRESHOLD)
 
-    # NaN ratio (all-zero phases) passes through; only flag rows with a real excess.
-    flagged = ratio > config.PHASE_IMBALANCE_RATIO_THRESHOLD
-    result = df[~flagged.fillna(False)].copy()
-    print(f"  filter_phase_imbalance: dropped {before - len(result):>6,} rows "
-          f"(phase ratio > {config.PHASE_IMBALANCE_RATIO_THRESHOLD})")
+    result = df[~(current_flag | voltage_flag | inverter_flag)].copy()
+    dropped = before - len(result)
+    print(f"  filter_phase_imbalance: dropped {dropped:>6,} rows")
+    print(f"    by signal group     :  "
+          f"currents={current_flag.sum():,} (threshold {config.CURRENT_IMBALANCE_THRESHOLD:.0%})  "
+          f"voltages={voltage_flag.sum():,} (threshold {config.VOLTAGE_IMBALANCE_THRESHOLD:.0%})  "
+          f"inverters={inverter_flag.sum():,} (threshold {config.INVERTER_IMBALANCE_THRESHOLD:.0%})  "
+          f"(rows may overlap)")
     return result
 
 

@@ -13,6 +13,10 @@ COL_CURRENT_A = "METER - PRODUCTION, AC Current A Amps"
 COL_CURRENT_B = "METER - PRODUCTION, AC Current B Amps"
 COL_CURRENT_C = "METER - PRODUCTION, AC Current C Amps"
 
+COL_VOLTAGE_A = "METER - PRODUCTION, Voltage AN Volts"
+COL_VOLTAGE_B = "METER - PRODUCTION, Voltage BN Volts"
+COL_VOLTAGE_C = "METER - PRODUCTION, Voltage CN Volts"
+
 # ── Derived / output column names ───────────────────────────────────────────
 
 COL_TOTAL_INVERTER_KW = "total_inverter_kw"
@@ -26,9 +30,11 @@ COL_TIME_BUCKET = "TIME_BUCKET"
 # Rows where meter production is strictly below this value are nighttime / offline.
 NIGHTTIME_KW_THRESHOLD = 1.0
 
-# (max - min) / mean across the three phase currents must not exceed this ratio.
-# 0.05 = 5% spread; beyond that the row is treated as a sensor fault or grid anomaly.
-PHASE_IMBALANCE_RATIO_THRESHOLD = 0.05
+# (max - min) / mean per signal group must not exceed these ratios.
+# Each group has its own threshold because normal operating spread differs by signal type.
+CURRENT_IMBALANCE_THRESHOLD  = 0.03
+VOLTAGE_IMBALANCE_THRESHOLD  = 0.05
+INVERTER_IMBALANCE_THRESHOLD = 0.05
 
 # Inline-calculated efficiency bounds. Rows outside [MIN, MAX] are gross outliers.
 MIN_EFFICIENCY_PCT = 85.0
