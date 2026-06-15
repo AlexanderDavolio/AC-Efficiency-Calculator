@@ -2,6 +2,7 @@
 
 import calendar
 import os
+import re
 from pathlib import Path
 from typing import List
 
@@ -146,12 +147,17 @@ def summarise_inverters(record: SiteRecord) -> dict:
     df = record.enriched_df
     valid = df[df[config.COL_TOTAL_INVERTER_KW] > 0]
 
-    n = len(config.INVERTER_KW_COLS)
+    inv_cols = [c for c in df.columns if re.match(r"^Inverter \d+ AC kW$", c)]
+    if not inv_cols:
+        inv_cols = config.INVERTER_KW_COLS
+    inv_cols = sorted(inv_cols, key=lambda c: int(re.search(r"\d+", c).group()))
+
+    n = len(inv_cols)
     equal_share = 100.0 / n
 
     row = {"Site": record.site_id}
     shares = []
-    for i, col in enumerate(config.INVERTER_KW_COLS, start=1):
+    for i, col in enumerate(inv_cols, start=1):
         share = round((valid[col] / valid[config.COL_TOTAL_INVERTER_KW] * 100).mean(), 3)
         row[f"Inverter {i} Power Share (%)"] = share
         shares.append(share)

@@ -1,3 +1,14 @@
+from dataclasses import dataclass
+
+
+@dataclass
+class SiteConfig:
+    """Per-site ingestion parameters for ACE Built-In Query Report format."""
+    meter_patterns: list    # case-insensitive substrings; first matching column wins
+    expected_inverters: int  # warn if regex discovers a different count; 0 = skip check
+    voltage_type: str       # "line_to_line" (VacAB/BC/CA) or "line_to_neutral" (VanA/B/C)
+
+
 # Column name constants — edit here if the data schema changes; nowhere else.
 
 # ── Raw input columns (present in the DAS Excel export) ─────────────────────
@@ -65,3 +76,29 @@ MAX_EFFICIENCY_PCT = 110.0
 # Allowed deviation from equal inverter power share before flagging as imbalanced.
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.
 INVERTER_IMBALANCE_TOLERANCE_PP = 5
+
+# ── ACE Built-In Query Report format ────────────────────────────────────────
+
+# Meter column patterns searched in order when site_id is not in SITE_CONFIGS.
+ACE_METER_COLUMN_PATTERNS = [
+    "SEL-735",
+    "METER - PRODUCTION",
+    "Production Meter",
+]
+
+# Per-site overrides — keyed by sheet name (site_id).
+# Sites absent from this dict get ACE_METER_COLUMN_PATTERNS + no inverter count check.
+SITE_CONFIGS: dict = {
+    "acedata4": SiteConfig(
+        meter_patterns=["SEL-735"],
+        expected_inverters=17,
+        voltage_type="line_to_line",
+    ),
+}
+
+# Hidden flag column written by the loader; True for rows where any inverter's phase
+# currents (IacA/B/C) exceed the imbalance threshold.
+COL_ACE_PHASE_IMBALANCE_FLAG = "_ace_phase_imbalance"
+
+# Max absolute deviation from phase mean / mean must not exceed this for any inverter.
+ACE_PHASE_CURRENT_IMBALANCE_THRESHOLD = 0.05

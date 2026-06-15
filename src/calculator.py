@@ -1,16 +1,27 @@
 """Efficiency and loss calculations — each accepts a DataFrame and returns a DataFrame."""
 
+import re
+
 import numpy as np
 import pandas as pd
 
 from src import config
+
+_INV_KW_COL_RE = re.compile(r"^Inverter \d+ AC kW$")
+
+
+def _inverter_kw_cols(df: pd.DataFrame) -> list:
+    cols = [c for c in df.columns if _INV_KW_COL_RE.match(c)]
+    if not cols:
+        return config.INVERTER_KW_COLS
+    return sorted(cols, key=lambda c: int(re.search(r"\d+", c).group()))
 
 
 def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
     """Add INVERTER_TOTAL_KW and EFFICIENCY_PCT columns to the DataFrame."""
     df = df.copy()
 
-    df[config.COL_TOTAL_INVERTER_KW] = df[config.INVERTER_KW_COLS].sum(axis=1)
+    df[config.COL_TOTAL_INVERTER_KW] = df[_inverter_kw_cols(df)].sum(axis=1)
 
     # Only divide where inverter total is positive; undefined rows become NaN.
     df[config.COL_EFFICIENCY_PCT] = (
