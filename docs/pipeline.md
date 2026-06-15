@@ -23,21 +23,32 @@ Keeping `raw_df`, `cleaned_df`, and `enriched_df` as separate fields (rather tha
 
 ## Stage 1 — Load
 
-**Module:** `src/csv_loader.py`
+**Modules:** `src/excel_loader.py` (Excel workbook mode) · `src/csv_loader.py` (CSV mode)
 
-**What happens:**
+`main.py` inspects `data/raw/` at startup and routes to the correct loader automatically:
 
-1. The loader scans `data/raw/` and finds all files with a `.csv` extension.
-2. For each file, it reads the CSV, strips leading/trailing whitespace from all column names, and attempts to parse the timestamp column as a datetime. Rows with unparseable timestamps become `NaT`.
+| What's in `data/raw/` | Loader used |
+|---|---|
+| A `.xlsx` file | `excel_loader` — each sheet is one site |
+| `.csv` files only | `csv_loader` — each file is one site |
+| Both `.xlsx` and `.csv` files | `excel_loader` wins; CSVs are ignored with a warning |
+
+**What happens (both loaders):**
+
+1. Each site's data is read into a DataFrame. Column names are stripped of leading/trailing whitespace.
+2. The timestamp column is parsed to datetime. Rows with unparseable timestamps become `NaT`.
 3. All non-timestamp columns are coerced to float. Any value that cannot be converted (empty strings, `"---"`, `"N/A"`) becomes `NaN`.
 4. A `SiteRecord` is created and `raw_df` is populated.
-5. If a file fails to load entirely (encoding error, wrong format), a warning is printed and that file is skipped. All other files continue normally.
+
+**Excel workbook specifics:** sheets missing any required column are skipped with a warning listing the absent columns. Sheets with zero valid rows after parsing are also skipped. If the workbook file itself cannot be opened, the pipeline stops with an error. The null rate per numeric column is included in the console summary so sparse sheets are immediately visible.
+
+**CSV specifics:** if a file fails to load entirely (encoding error, wrong format), a warning is printed and that file is skipped. All other files continue normally.
 
 **Console output to watch for:**
-- File name and row count for each successfully loaded site
-- The date range of the loaded data (first and last timestamp)
+- Site name, row count, and date range for each successfully loaded site
 - Column list — useful for verifying that expected columns parsed correctly
-- A warning line for any file that was skipped
+- A null rate line (Excel mode) showing which columns have missing values and how many
+- Warning lines for any sheet or file that was skipped and why
 
 ---
 

@@ -10,9 +10,7 @@ def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
     """Add INVERTER_TOTAL_KW and EFFICIENCY_PCT columns to the DataFrame."""
     df = df.copy()
 
-    df[config.COL_TOTAL_INVERTER_KW] = (
-        df[config.COL_INV1_AC_KW] + df[config.COL_INV2_AC_KW]
-    )
+    df[config.COL_TOTAL_INVERTER_KW] = df[config.INVERTER_KW_COLS].sum(axis=1)
 
     # Only divide where inverter total is positive; undefined rows become NaN.
     df[config.COL_EFFICIENCY_PCT] = (

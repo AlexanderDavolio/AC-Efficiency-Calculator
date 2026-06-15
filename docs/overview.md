@@ -27,7 +27,7 @@ The tool works with the following measurement streams from the raw DAS export:
 
 - **Inverter AC output power** — per-inverter active power readings, used as the "supply" side of the efficiency calculation
 - **Three-phase AC currents** — phase A, B, and C current readings used to detect electrical imbalance conditions that indicate faulty or anomalous operating states
-- **Three-phase AC voltages** — phase A, B, and C voltage readings available for future analysis (currently loaded but not used in cleaning or calculations)
+- **Three-phase AC voltages** — phase A, B, and C line-to-neutral voltage readings, used alongside phase currents in the imbalance detection filter
 - **Production meter reading** — the site-level active power measurement at the point of interconnection, used as the "delivered" side of the efficiency calculation
 - **Timestamp** — the local site time for each measurement row, used to filter periods and assign time-of-day buckets
 
@@ -41,7 +41,7 @@ LOAD  →  CLEAN  →  CALCULATE  →  REPORT
 
 | Stage | What Happens |
 |---|---|
-| **Load** | Discovers all CSVs in the input folder, parses timestamps and numeric columns, reports a row count and date range per site |
+| **Load** | Detects whether input is a multi-sheet Excel workbook or a folder of CSVs, parses timestamps and numeric columns, reports a row count and date range per site |
 | **Clean** | Applies four sequential filters to remove nighttime rows, offline readings, phase-imbalance anomalies, and gross efficiency outliers |
 | **Calculate** | Derives efficiency percentage, loss delta, and time-of-day classification for every remaining row |
 | **Report** | Writes a per-site cleaned CSV and a single multi-tab Excel workbook covering all sites |
@@ -52,7 +52,7 @@ Each stage is independent and self-contained. The output of one stage feeds the 
 
 ## What a Typical Run Looks Like
 
-1. You drop one or more site CSV exports into `data/raw/`
+1. You drop input data into `data/raw/` — either a single `.xlsx` workbook (one sheet per site) or one `.csv` file per site
 2. You run `main.py`
 3. The console prints per-stage progress: file discovery, row counts before and after each filter, efficiency averages, and output file paths
 4. In `output/`, you find a cleaned CSV per site and one Excel workbook covering all sites

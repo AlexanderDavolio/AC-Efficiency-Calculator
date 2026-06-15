@@ -22,13 +22,10 @@ def filter_nighttime(df: pd.DataFrame) -> pd.DataFrame:
 def filter_offline(df: pd.DataFrame) -> pd.DataFrame:
     """Drop rows where both inverters and the meter are all at zero simultaneously."""
     before = len(df)
-    both_inv_zero = (
-        (df[config.COL_INV1_AC_KW] == 0) &
-        (df[config.COL_INV2_AC_KW] == 0)
-    )
+    all_inv_zero = (df[config.INVERTER_KW_COLS] == 0).all(axis=1)
     meter_zero_or_neg = df[config.COL_METER_PRODUCTION_KW] <= 0
-    # Keep the row unless all three conditions fire at once.
-    result = df[~(both_inv_zero & meter_zero_or_neg)].copy()
+    # Keep the row unless all inverters and the meter are zero simultaneously.
+    result = df[~(all_inv_zero & meter_zero_or_neg)].copy()
     print(f"  filter_offline        : dropped {before - len(result):>6,} rows "
           f"(both inverters + meter = 0)")
     return result
@@ -57,9 +54,15 @@ def filter_phase_imbalance(df: pd.DataFrame) -> pd.DataFrame:
     """
     before = len(df)
 
-    current_flag  = _imbalance_flagged(df, [config.COL_CURRENT_A, config.COL_CURRENT_B, config.COL_CURRENT_C], config.CURRENT_IMBALANCE_THRESHOLD)
-    voltage_flag  = _imbalance_flagged(df, [config.COL_VOLTAGE_A, config.COL_VOLTAGE_B, config.COL_VOLTAGE_C], config.VOLTAGE_IMBALANCE_THRESHOLD)
-    inverter_flag = _imbalance_flagged(df, [config.COL_INV1_AC_KW, config.COL_INV2_AC_KW],                     config.INVERTER_IMBALANCE_THRESHOLD)
+    current_flag = _imbalance_flagged(df, [config.COL_CURRENT_A, config.COL_CURRENT_B, config.COL_CURRENT_C], config.CURRENT_IMBALANCE_THRESHOLD)
+    voltage_flag = _imbalance_flagged(df, [config.COL_VOLTAGE_A, config.COL_VOLTAGE_B, config.COL_VOLTAGE_C], config.VOLTAGE_IMBALANCE_THRESHOLD)
+
+    if len(config.INVERTER_KW_COLS) >= 2:
+        inverter_flag = _imbalance_flagged(df, config.INVERTER_KW_COLS, config.INVERTER_IMBALANCE_THRESHOLD)
+        inv_note = f"inverters={inverter_flag.sum():,} (threshold {config.INVERTER_IMBALANCE_THRESHOLD:.0%})"
+    else:
+        inverter_flag = pd.Series(False, index=df.index)
+        inv_note = "inverters=skipped (only 1 inverter configured)"
 
     result = df[~(current_flag | voltage_flag | inverter_flag)].copy()
     dropped = before - len(result)
@@ -67,7 +70,7 @@ def filter_phase_imbalance(df: pd.DataFrame) -> pd.DataFrame:
     print(f"    by signal group     :  "
           f"currents={current_flag.sum():,} (threshold {config.CURRENT_IMBALANCE_THRESHOLD:.0%})  "
           f"voltages={voltage_flag.sum():,} (threshold {config.VOLTAGE_IMBALANCE_THRESHOLD:.0%})  "
-          f"inverters={inverter_flag.sum():,} (threshold {config.INVERTER_IMBALANCE_THRESHOLD:.0%})  "
+          f"{inv_note}  "
           f"(rows may overlap)")
     return result
 

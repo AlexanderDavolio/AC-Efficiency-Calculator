@@ -138,20 +138,27 @@ def summarise_by_time_bucket(record: SiteRecord) -> pd.DataFrame:
 
 
 def summarise_inverters(record: SiteRecord) -> dict:
-    """Return a dict of inverter power share metrics with an imbalance note."""
+    """Return a dict of inverter power share metrics with a scaled imbalance note.
+
+    Equal share = 100 / n_inverters. A site is flagged if any inverter deviates
+    more than 10 percentage points from that equal share.
+    """
     df = record.enriched_df
     valid = df[df[config.COL_TOTAL_INVERTER_KW] > 0]
 
-    inv1_share = round((valid[config.COL_INV1_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100).mean(), 3)
-    inv2_share = round((valid[config.COL_INV2_AC_KW] / valid[config.COL_TOTAL_INVERTER_KW] * 100).mean(), 3)
-    balanced = (45 <= inv1_share <= 55) and (45 <= inv2_share <= 55)
+    n = len(config.INVERTER_KW_COLS)
+    equal_share = 100.0 / n
 
-    return {
-        "Site":                       record.site_id,
-        "Inverter 1 Power Share (%)": inv1_share,
-        "Inverter 2 Power Share (%)": inv2_share,
-        "Notes":                      "" if balanced else "Imbalance detected",
-    }
+    row = {"Site": record.site_id}
+    shares = []
+    for i, col in enumerate(config.INVERTER_KW_COLS, start=1):
+        share = round((valid[col] / valid[config.COL_TOTAL_INVERTER_KW] * 100).mean(), 3)
+        row[f"Inverter {i} Power Share (%)"] = share
+        shares.append(share)
+
+    imbalanced = any(abs(s - equal_share) > config.INVERTER_IMBALANCE_TOLERANCE_PP for s in shares)
+    row["Notes"] = "Imbalance detected" if imbalanced else ""
+    return row
 
 
 # ── Outputs ───────────────────────────────────────────────────────────────────

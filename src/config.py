@@ -9,6 +9,15 @@ COL_METER_PRODUCTION_KW = "METER - PRODUCTION, Active Power Kilowatts"
 COL_INV1_AC_KW = "INVERTER 1, AC power Kilowatts"
 COL_INV2_AC_KW = "INVERTER 2, AC power Kilowatts"
 
+# Single source of truth for all inverter kW columns. Add a new entry here
+# when a site has a third (or more) inverter — nothing else in the pipeline
+# needs to change. COL_INV1_AC_KW / COL_INV2_AC_KW remain as named constants
+# because the Excel workbook loader's required-column check references them directly.
+INVERTER_KW_COLS = [
+    COL_INV1_AC_KW,
+    COL_INV2_AC_KW,
+]
+
 COL_CURRENT_A = "METER - PRODUCTION, AC Current A Amps"
 COL_CURRENT_B = "METER - PRODUCTION, AC Current B Amps"
 COL_CURRENT_C = "METER - PRODUCTION, AC Current C Amps"
@@ -39,3 +48,7 @@ INVERTER_IMBALANCE_THRESHOLD = 0.05
 # Inline-calculated efficiency bounds. Rows outside [MIN, MAX] are gross outliers.
 MIN_EFFICIENCY_PCT = 85.0
 MAX_EFFICIENCY_PCT = 105.0
+
+# Allowed deviation from equal inverter power share before flagging as imbalanced.
+# E.g., with 2 inverters (equal share = 50%), a value of 5 flags anything outside 45–55%.
+INVERTER_IMBALANCE_TOLERANCE_PP = 5
