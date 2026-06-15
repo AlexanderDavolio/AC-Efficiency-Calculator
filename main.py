@@ -20,7 +20,7 @@ from src.csv_loader import load_all_sites
 from src.excel_loader import load_workbook
 from src.cleaners import run_all_filters
 from src.calculator import run_all_calculations
-from src.reporter import run_all_reports
+from src import config
 
 
 RAW_DATA_DIR = Path(__file__).resolve().parent / "data" / "raw"
@@ -60,7 +60,9 @@ def main() -> None:
         r.enriched_df = run_all_calculations(r.cleaned_df)
 
     # ── 4. REPORT ────────────────────────────────────────────────────────────
-    run_all_reports(records)
+    for r in records:
+        avg_eff = r.enriched_df[config.COL_EFFICIENCY_PCT].mean()
+        print(f"{r.site_id}: {avg_eff:.2f}%")
 
 
 if __name__ == "__main__":

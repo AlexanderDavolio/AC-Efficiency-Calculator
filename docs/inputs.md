@@ -34,6 +34,8 @@ If both a `.xlsx` file and `.csv` files are present, the `.xlsx` takes precedenc
 
 One workbook, one sheet per site. The sheet name is used as the site identifier in all reports — use a name that is meaningful, such as the site name or SCADA asset ID. Avoid special characters that are invalid in Excel sheet names or file paths.
 
+Both standard (transitional) and strict OOXML formats are supported. Strict OOXML is the default format produced by newer versions of Excel when saving to OneDrive or SharePoint — the loader detects it automatically and converts the file in memory before parsing. No manual re-save is required.
+
 Sheets that are missing any required column are skipped automatically with a warning; other sheets in the same workbook continue to process normally.
 
 ### CSV files
@@ -46,32 +48,36 @@ One CSV per site. The filename stem becomes the site identifier. There is no enf
 
 ## Required Columns
 
-The tool expects the following measurement streams in the CSV. Column names are mapped in `src/config.py` — see [configuration.md](configuration.md) if your DAS uses different headers.
+The tool expects the following measurement streams. Column names are mapped in `src/config.py`.
 
-| Concept | What It Represents |
-|---|---|
-| **Timestamp** | Local site time for each measurement interval. Should be parseable as a datetime (e.g., ISO 8601 or common US formats). |
-| **Production meter — active power** | Site-level active power at the point of interconnection, in kilowatts. This is the "delivered" side of the efficiency calculation. |
-| **Inverter 1 — AC power** | Active power output of inverter 1, in kilowatts. |
-| **Inverter 2 — AC power** | Active power output of inverter 2, in kilowatts. |
-| **Phase A current** | AC current on phase A, used for imbalance detection. |
-| **Phase B current** | AC current on phase B, used for imbalance detection. |
-| **Phase C current** | AC current on phase C, used for imbalance detection. |
-| **Phase A voltage** | Line-to-neutral voltage on phase A, used for imbalance detection. |
-| **Phase B voltage** | Line-to-neutral voltage on phase B, used for imbalance detection. |
-| **Phase C voltage** | Line-to-neutral voltage on phase C, used for imbalance detection. |
+The DAS export format has **two header rows**: row 0 contains column names and row 1 contains units (V, A, kWh). The units row is skipped automatically — no manual editing of the export is needed.
+
+Per-inverter AC power (kW) is **computed by the loader** as `voltage × current / 1000`. The meter column reports energy per interval (kWh); this is converted to average power (kW) using the interval length configured in `config.INTERVAL_MINUTES` (default: 15 minutes).
+
+| Column in export | What It Represents | Used for |
+|---|---|---|
+| **Timestamp** | Local site time for each measurement interval. | All stages |
+| **Production meter net energy Kilowatt hours** | Energy delivered to the grid in this interval (kWh). Converted to average kW in the loader. | Efficiency numerator |
+| **Inverter 1, AC voltage** | AC voltage at inverter 1 output (V). | Power computation, voltage imbalance filter |
+| **Inverter 1, AC current** | AC current at inverter 1 output (A). | Power computation, current imbalance filter |
+| **Inverter 2, AC voltage** | AC voltage at inverter 2 output (V). | Power computation, voltage imbalance filter |
+| **Inverter 2, AC current** | AC current at inverter 2 output (A). | Power computation, current imbalance filter |
+| **Inverter 3, AC voltage** | AC voltage at inverter 3 output (V). | Power computation, voltage imbalance filter |
+| **Inverter 3, AC current** | AC current at inverter 3 output (A). | Power computation, current imbalance filter |
 
 ---
 
 ## What Happens If a Column Is Missing or Malformed
 
-**Missing column:** The pipeline will raise a `KeyError` at the first stage that references that column. The error message will include the column name as defined in `config.py`. Check that your CSV headers match the names configured there (after whitespace stripping — the loader trims leading/trailing spaces from all column names automatically).
+**Missing column:** The loader prints a warning and skips that sheet. The missing column names are listed so you can compare them against the export. All column names are trimmed of leading/trailing whitespace automatically.
 
 **Malformed numeric values:** Any non-numeric value in a numeric column (e.g., `"---"`, `"N/A"`, empty string) is silently coerced to `NaN` by the loader. Rows with `NaN` in columns used by a filter are typically dropped or passed through depending on the filter logic — see [pipeline.md](pipeline.md) for details.
 
 **Malformed timestamps:** Rows where the timestamp cannot be parsed are set to `NaT`. These rows are not explicitly filtered out but will produce `NaN` in the month and time-bucket columns added by the calculator. They will appear in the cleaned CSV but may distort the monthly summary if there are many of them.
 
 **Completely unparseable file:** If a CSV fails to load at all (e.g., wrong encoding, binary content, completely wrong structure), the loader logs a warning and skips that file. Other sites in the same run are unaffected. For Excel workbooks, if the file itself cannot be opened the pipeline stops with a clear error; if an individual sheet is missing required columns or has zero valid rows, that sheet is skipped and the rest of the workbook continues.
+
+**Strict OOXML format:** Excel files saved via OneDrive or SharePoint are often in strict OOXML format, which the standard openpyxl reader cannot parse directly. The loader detects this automatically and patches the file in memory — you will see a note in the console (`NOTE: '...' uses strict OOXML — converted to transitional in memory`). No action is required on your end.
 
 ---
 

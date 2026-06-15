@@ -10,8 +10,8 @@ Every site is represented by a `SiteRecord` dataclass that flows through all fou
 
 | Field | Set By | Contains |
 |---|---|---|
-| `site_id` | Load | Site name derived from the CSV filename stem |
-| `source_path` | Load | Absolute path to the source CSV |
+| `site_id` | Load | Site name (sheet name for Excel, filename stem for CSV) |
+| `source_path` | Load | Absolute path to the source file |
 | `raw_df` | Load | The original DataFrame as parsed — never modified after this point |
 | `cleaned_df` | Clean | DataFrame after all four filters have been applied |
 | `enriched_df` | Calculate | DataFrame after efficiency, loss delta, and time buckets have been added |
@@ -40,7 +40,14 @@ Keeping `raw_df`, `cleaned_df`, and `enriched_df` as separate fields (rather tha
 3. All non-timestamp columns are coerced to float. Any value that cannot be converted (empty strings, `"---"`, `"N/A"`) becomes `NaN`.
 4. A `SiteRecord` is created and `raw_df` is populated.
 
-**Excel workbook specifics:** sheets missing any required column are skipped with a warning listing the absent columns. Sheets with zero valid rows after parsing are also skipped. If the workbook file itself cannot be opened, the pipeline stops with an error. The null rate per numeric column is included in the console summary so sparse sheets are immediately visible.
+**Excel workbook specifics:** both transitional and strict OOXML formats are handled. Files saved via OneDrive or SharePoint are typically strict OOXML — the loader detects this and converts the namespaces in memory before parsing (a note is printed to the console).
+
+The DAS export format has a two-row header: row 0 contains column names and row 1 contains units (V, A, kWh). The units row is skipped automatically. Two sets of derived columns are then computed before the `SiteRecord` is created:
+
+- **Per-inverter AC power (kW):** `voltage × current / 1000` for each inverter (single-phase power formula). These become the `Inverter N AC kW` columns used by all downstream stages.
+- **Meter average power (kW):** the per-interval energy reading (kWh) is multiplied by `60 / INTERVAL_MINUTES` to convert to average kW. The default interval is 15 minutes (configurable in `config.py`).
+
+Sheets missing any required raw column are skipped with a warning listing the absent columns. Sheets with zero valid rows after parsing are also skipped. If the workbook file itself cannot be opened, the pipeline stops with an error. The null rate for the derived kW columns is included in the console summary so sparse sheets are immediately visible.
 
 **CSV specifics:** if a file fails to load entirely (encoding error, wrong format), a warning is printed and that file is skipped. All other files continue normally.
 
@@ -66,17 +73,17 @@ Drops rows where the meter production reading falls below the configured kilowat
 
 Drops rows where all inverters simultaneously report zero output and the meter also reads zero or negative. This catches total-site offline events that the nighttime floor alone misses — for example, a midday grid outage where the meter reading is zero but daytime conditions would otherwise pass the floor check.
 
-### Filter 3 — Phase Imbalance
+### Filter 3 — Imbalance Detection
 
 Checks three signal groups independently for imbalance. For each group, the spread is computed per row as `(max − min) / mean` across the signals in that group. A row is dropped if it exceeds the configured threshold in **any** of the three groups.
 
 | Group | Signals | What a high ratio indicates |
 |---|---|---|
-| Phase currents | AC current on phases A, B, C | Grid fault, open-phase condition, or a current sensor reporting incorrectly |
-| Phase voltages | Line-to-neutral voltage on phases A, B, C | Voltage sag or swell on one phase, upstream grid imbalance |
-| Inverter outputs | AC power from inverter 1 and inverter 2 | MPPT divergence, string fault, or hardware de-rating on one inverter |
+| Inverter currents | AC current at inverter 1, 2, 3 output | An inverter offline, a blown fuse, or a current sensor failure |
+| Inverter voltages | AC voltage at inverter 1, 2, 3 output | Grid fault or voltage sag at one inverter's connection point |
+| Inverter kW outputs | Computed AC power at inverter 1, 2, 3 | An inverter de-rated or offline while others produce normally |
 
-Each group has its own threshold constant in `config.py` because normal operating spread differs by signal type — voltage is inherently tighter than inverter power output under normal conditions. The console output reports per-group flag counts alongside the threshold used for each, so you can see exactly which group is driving dropout for a given run.
+Each group has its own threshold in `config.py`. Voltage is inherently tight (5% threshold) because all inverters connect to the same grid. Current and kW use a looser threshold (50%) because different inverters at a site may have different string sizes and naturally produce different outputs under normal conditions. The console output reports per-group flag counts alongside the threshold used, so you can see exactly which group is driving dropout for a given run.
 
 Rows where all signals in a group read zero produce an undefined ratio and pass through as `NaN`. They will have been caught by the offline filter in a normal run.
 
@@ -119,24 +126,13 @@ Extracts the hour from each timestamp and assigns two derived columns:
 
 ## Stage 4 — Report
 
-**Module:** `src/reporter.py`
+**Module:** `main.py` (inline)
 
-### Per-Site Cleaned CSV
+For each site, the average efficiency across all cleaned rows is printed to the console as a percentage:
 
-For each site, the enriched DataFrame (all cleaned rows plus all derived columns) is written to `output/<site_id>_cleaned.csv`. This file contains the full row-level detail used to produce the summary statistics.
+```
+2 Twosome Dr: 99.22%
+21 Sanzari:   98.85%
+```
 
-### Excel Workbook
-
-A single workbook covering all sites in the run is written to `output/efficiency_report.xlsx`. It contains four sheets:
-
-1. **Summary** — one row per site, key aggregate metrics
-2. **Monthly** — one row per site per month, efficiency and loss delta statistics
-3. **Time of Day** — one row per site per time bucket (Morning, Peak, Afternoon), efficiency and loss delta statistics
-4. **Inverter Split** — one row per site, average power share and average output for each inverter
-
-Column widths are auto-fitted. On Windows, the workbook opens automatically when the run completes.
-
-**Console output to watch for:**
-- Confirmation that the cleaned CSV was written for each site
-- The path to the Excel workbook
-- Any per-site summary statistics printed during report generation
+The `src/reporter.py` module contains additional reporting functions (monthly breakdown, time-of-day summary, inverter split, Excel workbook output) that are available for use but not wired into the default run. To enable them, import and call `run_all_reports(records)` from `main.py` in place of the inline print loop.

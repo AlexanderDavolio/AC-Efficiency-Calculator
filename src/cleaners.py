@@ -83,7 +83,7 @@ def filter_gross_outliers(df: pd.DataFrame) -> pd.DataFrame:
     are already handled upstream by filter_offline.
     """
     before = len(df)
-    inv_total = df[config.COL_INV1_AC_KW] + df[config.COL_INV2_AC_KW]
+    inv_total = df[config.INVERTER_KW_COLS].sum(axis=1)
 
     # Only divide where inverter total is positive; everything else becomes NaN.
     eff = (df[config.COL_METER_PRODUCTION_KW] / inv_total.where(inv_total > 0)) * 100
