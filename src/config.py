@@ -33,6 +33,8 @@ INTERVAL_MINUTES = 15
 COL_TOTAL_INVERTER_KW = "total_inverter_kw"
 COL_EFFICIENCY_PCT = "efficiency_pct"
 COL_LOSS_DELTA_KW = "loss_delta_kw"
+COL_LOSS_PCT = "loss_pct"
+COL_ENERGY_LOST_KWH = "energy_lost_kwh"
 COL_MONTH = "MONTH"
 COL_TIME_BUCKET = "TIME_BUCKET"
 
@@ -105,6 +107,9 @@ SITE_CONFIGS: dict = {
         inverter_patterns=["RGM"],
     ),
     "2 Commerce Drive": SiteConfig(
+        inverter_patterns=["INVERTER"],
+    ),
+    "2 Executive Drive": SiteConfig(
         inverter_patterns=["INVERTER"],
     ),
 }

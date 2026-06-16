@@ -92,7 +92,9 @@ def load_site(csv_path: Path) -> SiteRecord:
         pd.to_numeric(df[meter_col], errors="coerce") * kw_factor
     )
 
-    # Per-inverter kW — discover columns via config patterns, extract number from name
+    # Per-inverter kW — discover columns via config patterns, extract number from name.
+    # Multiple columns sharing the same number (e.g. "INVERTER 1-1", "INVERTER 1-2")
+    # are treated as strings of the same inverter and summed.
     seen_nums: dict = {}
     for c in df.columns:
         c_lc = c.lower()
@@ -101,8 +103,7 @@ def load_site(csv_path: Path) -> SiteRecord:
                 m = re.search(r"\d+", c)
                 if m:
                     num = int(m.group())
-                    if num not in seen_nums:
-                        seen_nums[num] = c
+                    seen_nums.setdefault(num, []).append(c)
                 break
     inv_kwh_matches = sorted(seen_nums.items(), key=lambda x: x[0])
 
@@ -112,9 +113,12 @@ def load_site(csv_path: Path) -> SiteRecord:
             f"(patterns searched: {inv_patterns})"
         )
 
-    for inv_num, kwh_col in inv_kwh_matches:
-        df[kwh_col] = pd.to_numeric(df[kwh_col], errors="coerce")
-        df[f"Inverter {inv_num} AC kW"] = (df[kwh_col] * kw_factor).fillna(0.0)
+    for inv_num, kwh_cols in inv_kwh_matches:
+        for c in kwh_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[f"Inverter {inv_num} AC kW"] = (
+            df[kwh_cols].sum(axis=1, skipna=True) * kw_factor
+        )
 
     # Coerce V/I columns to numeric; pass through as raw
     for pat in config.ACE_METER_VOLTAGE_PATTERNS + config.ACE_METER_CURRENT_PATTERNS:

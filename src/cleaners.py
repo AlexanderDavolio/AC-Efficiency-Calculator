@@ -40,17 +40,6 @@ def _raw_inverter_cols(df: pd.DataFrame, site_id: str = "") -> list:
     return [c for _, c in sorted(seen.items(), key=lambda x: x[0])]
 
 
-def _find_phase_cols(df: pd.DataFrame, patterns: list) -> list:
-    """Return one column per pattern via case-insensitive substring match; None for no match."""
-    lower_map = {c.lower(): c for c in df.columns}
-    result = []
-    for pat in patterns:
-        pat_lc = pat.lower()
-        match = next((orig for lc, orig in lower_map.items() if pat_lc in lc), None)
-        result.append(match)
-    return result
-
-
 def filter_inverter_active(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     """Drop rows where any inverter reports zero or negative kWh (offline or nighttime)."""
     before = len(df)
@@ -60,30 +49,6 @@ def filter_inverter_active(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     dropped = before - len(result)
     site_tag = f" [{site_id}]" if site_id else ""
     print(f"  filter_inverter_active       {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}")
-    return result
-
-
-def filter_meter_phase_imbalance(df: pd.DataFrame, site_id: str = "", phase_threshold: float = 0.01) -> pd.DataFrame:
-    """Drop rows where any meter phase voltage or current deviates > phase_threshold from the 3-phase mean."""
-    before = len(df)
-    threshold = phase_threshold
-
-    flag = pd.Series(False, index=df.index)
-
-    for patterns in (config.ACE_METER_VOLTAGE_PATTERNS, config.ACE_METER_CURRENT_PATTERNS):
-        phase_cols = _find_phase_cols(df, patterns)
-        present = [c for c in phase_cols if c is not None]
-        if len(present) < 2:
-            continue
-        vals = df[present]
-        mean = vals.mean(axis=1)
-        deviations = vals.sub(mean, axis=0).abs().div(mean.where(mean != 0), axis=0)
-        flag |= (deviations > threshold).any(axis=1).fillna(False)
-
-    result = df[~flag].copy()
-    dropped = before - len(result)
-    site_tag = f" [{site_id}]" if site_id else ""
-    print(f"  filter_meter_phase_imbalance {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}")
     return result
 
 
@@ -104,14 +69,13 @@ def filter_gross_outliers(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     return result
 
 
-def run_all_filters(df: pd.DataFrame, site_id: str = "", phase_threshold: float = 0.01) -> pd.DataFrame:
+def run_all_filters(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     """Apply all filters in order and return the cleaned DataFrame."""
     rows_in = len(df)
     site_tag = f" [{site_id}]" if site_id else ""
     print(f"\n[cleaners]{site_tag} starting: {rows_in:,} rows")
 
     df = filter_inverter_active(df, site_id)
-    df = filter_meter_phase_imbalance(df, site_id, phase_threshold)
     df = filter_gross_outliers(df, site_id)
 
     rows_out = len(df)

@@ -25,7 +25,7 @@ from src.models import SiteRecord
 from src.csv_loader import load_all_sites
 from src.excel_loader import load_workbook
 from src.cleaners import run_all_filters
-from src.calculator import run_all_calculations, calculate_daily_flags
+from src.calculator import run_all_calculations
 from src.reporter import run_all_reports
 from src import config
 
@@ -74,7 +74,6 @@ def main() -> None:
     for r in records:
         r.cleaned_df  = run_all_filters(r.raw_df, r.site_id)
         r.enriched_df = run_all_calculations(r.cleaned_df)
-        r.daily_df    = calculate_daily_flags(r.enriched_df, r.raw_df)
 
     # ── 4. REPORT ────────────────────────────────────────────────────────────
     run_all_reports(records)
