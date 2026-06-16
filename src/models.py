@@ -20,5 +20,7 @@ class SiteRecord:
     cleaned_df: pd.DataFrame = field(repr=False, default=None)
     # DataFrame after efficiency and loss columns have been added.
     enriched_df: pd.DataFrame = field(repr=False, default=None)
+    # Per-day quality table: daylight intervals, clean intervals, good/bad flag.
+    daily_df: pd.DataFrame = field(repr=False, default=None)
     # Per-site summary statistics produced by the reporter.
     summary: dict = field(default_factory=dict)

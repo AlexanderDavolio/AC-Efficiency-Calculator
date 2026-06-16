@@ -18,17 +18,15 @@ ACE Built-In Query Report format:
   Row 5    — units row — skipped automatically
   Row 6+   — data rows
   Timestamps stored as Excel serial date floats — converted to datetime.
-  Per-inverter 3-phase power: P = √3 × V_LL_avg × I_avg / 1000
-    where V_LL_avg = mean(VacAB, VacBC, VacCA) and I_avg = mean(IacA, IacB, IacC).
-  Inverter columns discovered dynamically by regex; works for any number of inverters.
-  Per-inverter phase current imbalance precomputed as a flag column consumed by cleaners.
+  Per-inverter kW: inverter kWh × (60 / INTERVAL_MINUTES); columns discovered via site config inverter_patterns.
+  Meter kW: Wattnode Meter kWh ÷ interval_hours.
+  Meter phase voltages (VacA/B/C) and currents (IacA/B/C) passed through as raw numeric columns.
 
 Returns the same List[SiteRecord] contract as csv_loader.load_all_sites().
 """
 
 import io
 import re
-import math
 import zipfile
 import pandas as pd
 from pathlib import Path
@@ -96,46 +94,30 @@ def _find_meter_col(cols, patterns: list) -> str:
                 return original
     return None
 
-_SQRT3 = math.sqrt(3)
+
+_INTERVAL_TOLERANCE_MIN = 2
 
 
-def _is_ace_format(source) -> bool:
-    """Return True if cell A1 begins with 'Ace' (ACE Built-In Query Report preamble)."""
-    probe = pd.read_excel(source, sheet_name=0, header=None, nrows=1)
-    return str(probe.iloc[0, 0]).strip().startswith("Ace")
+def _validate_intervals(df: pd.DataFrame, site_id: str) -> None:
+    """Log a warning if any consecutive timestamp gap falls outside the expected interval.
 
-
-# ── Standard DAS format columns ───────────────────────────────────────────────
-
-_REQUIRED_RAW_COLUMNS = {
-    config.COL_TIMESTAMP,
-    config.COL_METER_KWH_RAW,
-    config.COL_VOLTAGE_A, config.COL_CURRENT_A,
-    config.COL_VOLTAGE_B, config.COL_CURRENT_B,
-    config.COL_VOLTAGE_C, config.COL_CURRENT_C,
-}
-
-# (voltage col, current col, derived kW col) — one entry per inverter
-_INVERTER_POWER_SPEC = [
-    (config.COL_VOLTAGE_A, config.COL_CURRENT_A, config.COL_INV1_AC_KW),
-    (config.COL_VOLTAGE_B, config.COL_CURRENT_B, config.COL_INV2_AC_KW),
-    (config.COL_VOLTAGE_C, config.COL_CURRENT_C, config.COL_INV3_AC_KW),
-]
-
-
-def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-inverter AC power (kW) and meter average power (kW) — standard format.
-
-    Per-inverter kW: V × A / 1000 (single-phase).
-    Meter kW: per-interval kWh × (60 / INTERVAL_MINUTES).
+    Diagnostic only — does not modify the DataFrame or raise.
     """
-    df = df.copy()
-    for col_v, col_a, col_kw in _INVERTER_POWER_SPEC:
-        df[col_kw] = df[col_v] * df[col_a] / 1000.0
+    ts = df[config.COL_TIMESTAMP].dropna().sort_values()
+    if len(ts) < 2:
+        return
 
-    kw_factor = 60.0 / config.INTERVAL_MINUTES
-    df[config.COL_METER_PRODUCTION_KW] = df[config.COL_METER_KWH_RAW] * kw_factor
-    return df
+    delta_min = ts.diff().dropna().dt.total_seconds() / 60
+    lo = config.INTERVAL_MINUTES - _INTERVAL_TOLERANCE_MIN
+    hi = config.INTERVAL_MINUTES + _INTERVAL_TOLERANCE_MIN
+    bad = delta_min[(delta_min < lo) | (delta_min > hi)]
+
+    if not bad.empty:
+        print(
+            f"[excel_loader] WARNING: site '{site_id}' — {len(bad):,} intervals outside "
+            f"{lo}–{hi} min (expected {config.INTERVAL_MINUTES} min); "
+            f"min={bad.min():.1f} min, max={bad.max():.1f} min"
+        )
 
 
 def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
@@ -143,118 +125,86 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
 
     Timestamps are Excel serial date floats — converted via origin='1899-12-30'.
 
-    Meter column is discovered by scanning df.columns against the patterns in the site's
-    SiteConfig (or ACE_METER_COLUMN_PATTERNS as fallback) — no hardcoded column name.
+    Meter kWh column discovered by pattern match (site config or ACE_METER_COLUMN_PATTERNS
+    fallback); converted to kW as kWh / interval_hours.
 
-    Per-inverter 3-phase power is computed from voltage and current columns discovered by
-    regex (one group per INV-N).  The voltage column suffixes and scalar factor depend on
-    voltage_type from SiteConfig:
-        line_to_line:    P = √3 × mean(VacAB, VacBC, VacCA) × mean(IacA, IacB, IacC) / 1000
-        line_to_neutral: P =  3 × mean(VanA,  VanB,  VanC)  × mean(IacA, IacB, IacC) / 1000
+    Per-inverter kWh columns discovered via site config inverter_patterns (falls back to
+    ACE_INVERTER_COLUMN_PATTERNS). The first run of digits in the matching column name
+    becomes the inverter number; each column is converted to 'Inverter N AC kW'.
+    cleaners.py detects these derived columns via regex for the cross-inverter imbalance check.
 
-    One "Inverter N AC kW" column is written per discovered inverter (real values, not a
-    fake equal split).  cleaners.py detects these columns dynamically so the cross-inverter
-    imbalance check uses all N inverters.
-
-    A per-row phase current imbalance flag is precomputed and stored in
-    config.COL_ACE_PHASE_IMBALANCE_FLAG for filter_phase_imbalance in cleaners.
-    Standard COL_CURRENT/VOLTAGE columns are zeroed so the cross-inverter V/I checks pass.
+    Meter phase voltage (VacA/B/C) and current (IacA/B/C) columns are coerced to numeric
+    and passed through as raw columns for downstream use.
     """
     df = df.copy()
 
-    # Resolve site config
-    site_cfg       = config.SITE_CONFIGS.get(site_id)
-    meter_patterns = site_cfg.meter_patterns if site_cfg else config.ACE_METER_COLUMN_PATTERNS
-    voltage_type   = site_cfg.voltage_type   if site_cfg else "line_to_line"
-    expected_inv   = site_cfg.expected_inverters if site_cfg else 0
-
-    # Convert Excel serial date floats to datetime
-    df[config.COL_TIMESTAMP] = pd.to_datetime(
-        pd.to_numeric(df[config.COL_TIMESTAMP], errors="coerce"),
-        unit="D", origin="1899-12-30", errors="coerce",
+    site_cfg = config.SITE_CONFIGS.get(site_id)
+    meter_patterns = (
+        site_cfg.meter_patterns
+        if site_cfg and site_cfg.meter_patterns is not None
+        else config.ACE_METER_COLUMN_PATTERNS
+    )
+    inv_patterns = (
+        site_cfg.inverter_patterns
+        if site_cfg and site_cfg.inverter_patterns is not None
+        else config.ACE_INVERTER_COLUMN_PATTERNS
     )
 
-    # Discover and rename meter column
+    # Convert timestamps — openpyxl may already parse date cells as datetime objects;
+    # fall back to Excel serial date float conversion if direct parsing yields all NaT.
+    ts_raw = df[config.COL_TIMESTAMP]
+    ts = pd.to_datetime(ts_raw, errors="coerce")
+    if ts.isna().all():
+        ts = pd.to_datetime(
+            pd.to_numeric(ts_raw, errors="coerce"),
+            unit="D", origin="1899-12-30", errors="coerce",
+        )
+    df[config.COL_TIMESTAMP] = ts
+
+    kw_factor = 60.0 / config.INTERVAL_MINUTES  # kWh → kW for INTERVAL_MINUTES-min readings
+
+    # Discover meter kWh column and convert to kW
     meter_col = _find_meter_col(df.columns, meter_patterns)
     if meter_col is None:
         raise ValueError(
             f"[excel_loader] ACE site '{site_id}': no meter column matched {meter_patterns}"
         )
-    df = df.rename(columns={meter_col: config.COL_METER_KWH_RAW})
-    kw_factor = 60.0 / config.INTERVAL_MINUTES
     df[config.COL_METER_PRODUCTION_KW] = (
-        pd.to_numeric(df[config.COL_METER_KWH_RAW], errors="coerce") * kw_factor
+        pd.to_numeric(df[meter_col], errors="coerce") * kw_factor
     )
 
-    # Discover per-inverter column groups sorted by inverter number.
-    def _find_cols(suffix: str):
-        pat = re.compile(r"INV\s*-\s*(\d+).*,\s*" + re.escape(suffix) + r"$")
-        matched = [(int(pat.search(c).group(1)), c) for c in df.columns if pat.search(c)]
-        matched.sort(key=lambda x: x[0])
-        return [c for _, c in matched]
-
-    if voltage_type == "line_to_neutral":
-        v_suffixes = ["VanA", "VanB", "VanC"]
-        kw_scalar  = 3.0 / 1000.0
-    else:
-        v_suffixes = ["VacAB", "VacBC", "VacCA"]
-        kw_scalar  = _SQRT3 / 1000.0
-
-    v_col_groups = [_find_cols(s) for s in v_suffixes]
-    iac_a = _find_cols("IacA")
-    iac_b = _find_cols("IacB")
-    iac_c = _find_cols("IacC")
-
-    n_inv = len(v_col_groups[0])
-    if n_inv == 0:
+    # Discover per-inverter kWh columns via site-configured patterns; extract inverter
+    # number from the first run of digits in each matching column name.
+    seen_nums: dict = {}
+    for c in df.columns:
+        c_lc = c.lower()
+        for pat in inv_patterns:
+            if pat.lower() in c_lc:
+                m = re.search(r"\d+", c)
+                if m:
+                    num = int(m.group())
+                    if num not in seen_nums:
+                        seen_nums[num] = c
+                break
+    inv_kwh_matches = sorted(seen_nums.items(), key=lambda x: x[0])
+    if not inv_kwh_matches:
         raise ValueError(
-            f"[excel_loader] ACE site '{site_id}': no per-inverter voltage columns found "
-            f"(tried suffixes {v_suffixes})"
+            f"[excel_loader] ACE site '{site_id}': no inverter kWh columns found "
+            f"(patterns searched: {inv_patterns})"
         )
-    if expected_inv and n_inv != expected_inv:
-        print(
-            f"[excel_loader] WARNING: site '{site_id}' expected {expected_inv} inverters, "
-            f"found {n_inv}"
-        )
-    print(
-        f"[excel_loader] ACE site '{site_id}': {n_inv} inverters, "
-        f"voltage_type={voltage_type}, meter='{meter_col}'"
-    )
 
-    imbalance_cols: list[pd.Series] = []
+    n_inv = len(inv_kwh_matches)
+    for inv_num, kwh_col in inv_kwh_matches:
+        df[kwh_col] = pd.to_numeric(df[kwh_col], errors="coerce")
+        df[f"Inverter {inv_num} AC kW"] = (df[kwh_col] * kw_factor).fillna(0.0)
 
-    for i, (col_v1, col_v2, col_v3, col_ia, col_ib, col_ic) in enumerate(
-        zip(*v_col_groups, iac_a, iac_b, iac_c), start=1
-    ):
-        v1 = pd.to_numeric(df[col_v1], errors="coerce")
-        v2 = pd.to_numeric(df[col_v2], errors="coerce")
-        v3 = pd.to_numeric(df[col_v3], errors="coerce")
-        ia = pd.to_numeric(df[col_ia],  errors="coerce")
-        ib = pd.to_numeric(df[col_ib],  errors="coerce")
-        ic = pd.to_numeric(df[col_ic],  errors="coerce")
+    # Coerce meter phase voltage and current columns to numeric; pass through as raw
+    for pat in config.ACE_METER_VOLTAGE_PATTERNS + config.ACE_METER_CURRENT_PATTERNS:
+        col = _find_meter_col(df.columns, [pat])
+        if col is not None:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        v_avg = (v1 + v2 + v3) / 3.0
-        i_avg = (ia + ib + ic) / 3.0
-        df[f"Inverter {i} AC kW"] = (v_avg * i_avg * kw_scalar).fillna(0.0)
-
-        currents = pd.concat([ia, ib, ic], axis=1)
-        mean_i   = currents.mean(axis=1)
-        max_dev  = currents.sub(mean_i, axis=0).abs().max(axis=1)
-        ratio    = max_dev / mean_i.where(mean_i != 0)
-        imbalance_cols.append(ratio.fillna(0.0))
-
-    # Per-row flag: True if any inverter's phase current imbalance exceeds threshold.
-    max_ratio = pd.concat(imbalance_cols, axis=1).max(axis=1)
-    df[config.COL_ACE_PHASE_IMBALANCE_FLAG] = (
-        max_ratio > config.ACE_PHASE_CURRENT_IMBALANCE_THRESHOLD
-    )
-
-    # Zero standard V/I columns — cross-inverter imbalance checks in cleaners pass through.
-    for col in [
-        config.COL_VOLTAGE_A, config.COL_VOLTAGE_B, config.COL_VOLTAGE_C,
-        config.COL_CURRENT_A, config.COL_CURRENT_B, config.COL_CURRENT_C,
-    ]:
-        df[col] = 0.0
+    print(f"[excel_loader] ACE site '{site_id}': {n_inv} inverters, meter='{meter_col}'")
 
     return df
 
@@ -262,26 +212,19 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
 def load_workbook(xlsx_path: Path) -> List[SiteRecord]:
     """Load every sheet from an Excel workbook and return one SiteRecord per sheet.
 
-    Sheet name is used as site_id. Sheets missing required columns or with zero
-    valid rows are skipped with a warning.
+    site_id is read from preamble row 0 cell 0 (e.g. "Adams Farm - Built-In Query Report"
+    → "Adams Farm"). Falls back to the sheet name if that cell is empty.
+    Sheets missing required columns or with zero valid rows are skipped with a warning.
     """
     try:
         source = _to_transitional(xlsx_path)
-
-        # Peek at cell A1 to determine which format this workbook uses.
-        ace = _is_ace_format(source)
-        if hasattr(source, "seek"):
+        # First pass: read only preamble row 0 from each sheet to extract the site name.
+        preamble: dict = pd.read_excel(source, sheet_name=None, header=None, nrows=1)
+        if isinstance(source, io.BytesIO):
             source.seek(0)
-
-        if ace:
-            print(f"[excel_loader] NOTE: '{xlsx_path.name}' is ACE Built-In Query Report format")
-            all_sheets: dict = pd.read_excel(
-                source, sheet_name=None, header=_ACE_HEADER_ROW, skiprows=[_ACE_UNITS_ROW]
-            )
-        else:
-            # skiprows=[1] drops the units row (row index 1 after the header row).
-            all_sheets: dict = pd.read_excel(source, sheet_name=None, header=0, skiprows=[1])
-
+        all_sheets: dict = pd.read_excel(
+            source, sheet_name=None, header=_ACE_HEADER_ROW, skiprows=[_ACE_UNITS_ROW]
+        )
     except Exception as exc:
         raise RuntimeError(
             f"[excel_loader] Cannot open workbook '{xlsx_path}': {exc}"
@@ -294,47 +237,45 @@ def load_workbook(xlsx_path: Path) -> List[SiteRecord]:
     records = []
 
     for sheet_name, df in all_sheets.items():
-        site_id = sheet_name
+        # Derive site_id from preamble row 0, cell 0; strip " - ..." suffix (e.g. "Adams Farm -
+        # Built-In Query Report" → "Adams Farm"). Fall back to sheet name if row is empty.
+        preamble_df = preamble.get(sheet_name)
+        if preamble_df is not None and not pd.isna(preamble_df.iloc[0, 0]):
+            raw_name = str(preamble_df.iloc[0, 0]).strip()
+            site_id = raw_name.partition(" - ")[0].strip()
+        else:
+            site_id = sheet_name
+            print(
+                f"[excel_loader] WARNING: sheet '{sheet_name}' — preamble row 0 empty, "
+                f"using sheet name as site_id"
+            )
+
+        if site_id not in config.SITE_CONFIGS:
+            print(
+                f"[excel_loader] WARNING: site '{site_id}' not found in SITE_CONFIGS — "
+                f"add an entry to config.py to configure meter/inverter patterns"
+            )
 
         # Strip column name whitespace so comparisons against config constants work.
         df.columns = df.columns.str.strip()
 
-        if ace:
-            missing = _REQUIRED_ACE_RAW_COLUMNS - set(df.columns)
-            if missing:
-                print(
-                    f"[excel_loader] WARNING: skipping sheet '{site_id}' — "
-                    f"missing columns: {sorted(missing)}"
-                )
-                continue
-
-            df = _add_ace_derived_columns(df, site_id)
-
-        else:
-            # Validate required raw columns before doing any further work on this sheet.
-            missing = _REQUIRED_RAW_COLUMNS - set(df.columns)
-            if missing:
-                print(
-                    f"[excel_loader] WARNING: skipping sheet '{site_id}' — "
-                    f"missing columns: {sorted(missing)}"
-                )
-                continue
-
-            # Parse timestamp column; invalid entries become NaT.
-            df[config.COL_TIMESTAMP] = pd.to_datetime(
-                df[config.COL_TIMESTAMP], errors="coerce"
+        missing = _REQUIRED_ACE_RAW_COLUMNS - set(df.columns)
+        if missing:
+            print(
+                f"[excel_loader] WARNING: skipping sheet '{site_id}' — "
+                f"missing columns: {sorted(missing)}"
             )
+            continue
 
-            # Coerce all non-timestamp columns to float; non-numeric values become NaN.
-            numeric_cols = [c for c in df.columns if c != config.COL_TIMESTAMP]
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-
-            # Compute derived power columns from voltage × current and kWh → kW.
-            df = _add_derived_columns(df)
+        df = _add_ace_derived_columns(df, site_id)
 
         if len(df) == 0:
             print(f"[excel_loader] WARNING: skipping sheet '{site_id}' — zero rows")
             continue
+
+        # Sort by timestamp so interval deltas are meaningful, then validate.
+        df = df.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
+        _validate_intervals(df, site_id)
 
         # ── Sanity check ────────────────────────────────────────────────────────
         ts = df[config.COL_TIMESTAMP].dropna()

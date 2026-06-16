@@ -1,17 +1,23 @@
 """Entry point — runs the full AC efficiency pipeline.
 
 Pipeline order:
-    1. LOAD    — discover input data and read all sites into SiteRecord objects
-    2. CLEAN   — apply nighttime / offline / phase-imbalance / outlier filters
-    3. CALCULATE — add efficiency_pct and loss_delta_kw columns
-    4. REPORT  — write cleaned CSVs and the multi-tab Excel workbook
+    1. LOAD      — discover input data and read all sites into SiteRecord objects
+    2. CLEAN     — apply nighttime / offline / phase-imbalance / outlier filters
+    3. CALCULATE — add efficiency_pct, loss_delta_kw, and daily quality flag columns
+    4. REPORT    — print console tables (monthly, time-of-day, inverter split,
+                   daily quality, sensitivity analysis) and write cleaned CSVs
 
 Data source routing (checked in order):
     - A .xlsx file in data/raw/ → excel_loader (each sheet = one site)
     - CSV files in data/raw/    → csv_loader   (each file = one site)
     If both exist, the .xlsx takes precedence and CSVs are ignored.
+
+CLI flags:
+    --site NAME   Run only the site whose name contains NAME (case-insensitive,
+                  spaces ignored). E.g. --site 2commerce, --site adams.
 """
 
+import argparse
 from pathlib import Path
 from typing import List
 
@@ -19,7 +25,8 @@ from src.models import SiteRecord
 from src.csv_loader import load_all_sites
 from src.excel_loader import load_workbook
 from src.cleaners import run_all_filters
-from src.calculator import run_all_calculations
+from src.calculator import run_all_calculations, calculate_daily_flags
+from src.reporter import run_all_reports
 from src import config
 
 
@@ -50,19 +57,27 @@ def _load_records() -> List[SiteRecord]:
 
 def main() -> None:
     """Orchestrate the four pipeline stages end to end."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--site", help="Run only the site whose name contains this string (case-insensitive)")
+    args = parser.parse_args()
 
     # ── 1. LOAD ──────────────────────────────────────────────────────────────
     records = _load_records()
+    if args.site:
+        needle = args.site.lower().replace(" ", "")
+        records = [r for r in records if needle in r.site_id.lower().replace(" ", "")]
+        if not records:
+            print(f"[main] No site matching '{args.site}' found.")
+            return
 
     # ── 2. CLEAN + 3. CALCULATE ───────────────────────────────────────────────
     for r in records:
-        r.cleaned_df  = run_all_filters(r.raw_df)
+        r.cleaned_df  = run_all_filters(r.raw_df, r.site_id)
         r.enriched_df = run_all_calculations(r.cleaned_df)
+        r.daily_df    = calculate_daily_flags(r.enriched_df, r.raw_df)
 
     # ── 4. REPORT ────────────────────────────────────────────────────────────
-    for r in records:
-        avg_eff = r.enriched_df[config.COL_EFFICIENCY_PCT].mean()
-        print(f"{r.site_id}: {avg_eff:.2f}%")
+    run_all_reports(records)
 
 
 if __name__ == "__main__":

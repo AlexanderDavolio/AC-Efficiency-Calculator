@@ -4,9 +4,8 @@ from dataclasses import dataclass
 @dataclass
 class SiteConfig:
     """Per-site ingestion parameters for ACE Built-In Query Report format."""
-    meter_patterns: list    # case-insensitive substrings; first matching column wins
-    expected_inverters: int  # warn if regex discovers a different count; 0 = skip check
-    voltage_type: str       # "line_to_line" (VacAB/BC/CA) or "line_to_neutral" (VanA/B/C)
+    meter_patterns:    list = None   # None = fall back to ACE_METER_COLUMN_PATTERNS
+    inverter_patterns: list = None   # None = fall back to ACE_INVERTER_COLUMN_PATTERNS
 
 
 # Column name constants — edit here if the data schema changes; nowhere else.
@@ -18,30 +17,10 @@ COL_TIMESTAMP = "Timestamp"
 # Meter energy per interval — converted to average power (kW) in the loader.
 COL_METER_KWH_RAW = "Production meter net energy Kilowatt hours"
 
-# Per-inverter AC voltage and current — power is computed as V × A / 1000.
-COL_VOLTAGE_A = "Inverter 1, AC voltage"
-COL_CURRENT_A = "Inverter 1, AC current"
-COL_VOLTAGE_B = "Inverter 2, AC voltage"
-COL_CURRENT_B = "Inverter 2, AC current"
-COL_VOLTAGE_C = "Inverter 3, AC voltage"
-COL_CURRENT_C = "Inverter 3, AC current"
-
 # ── Derived columns added by the loader ─────────────────────────────────────
 
 # Meter average power: COL_METER_KWH_RAW × (60 / INTERVAL_MINUTES)
 COL_METER_PRODUCTION_KW = "Meter kW"
-
-# Per-inverter AC power: V × A / 1000 for each inverter
-COL_INV1_AC_KW = "Inverter 1 AC kW"
-COL_INV2_AC_KW = "Inverter 2 AC kW"
-COL_INV3_AC_KW = "Inverter 3 AC kW"
-
-# All inverter kW columns in order — add a new entry here for a fourth inverter.
-INVERTER_KW_COLS = [
-    COL_INV1_AC_KW,
-    COL_INV2_AC_KW,
-    COL_INV3_AC_KW,
-]
 
 # ── Data interval ────────────────────────────────────────────────────────────
 
@@ -77,22 +56,56 @@ MAX_EFFICIENCY_PCT = 110.0
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.
 INVERTER_IMBALANCE_TOLERANCE_PP = 5
 
+# Minimum fraction of expected daylight intervals that must be clean for a day to be "good".
+# Days below this threshold are excluded from monthly and overall efficiency averages.
+GOOD_DAY_MIN_CLEAN_PCT = 0.70
+
 # ── ACE Built-In Query Report format ────────────────────────────────────────
 
 # Meter column patterns searched in order when site_id is not in SITE_CONFIGS.
 ACE_METER_COLUMN_PATTERNS = [
+    "Wattnode Meter",
     "SEL-735",
     "METER - PRODUCTION",
     "Production Meter",
 ]
 
-# Per-site overrides — keyed by sheet name (site_id).
-# Sites absent from this dict get ACE_METER_COLUMN_PATTERNS + no inverter count check.
+# Meter phase voltage column patterns (VacA, VacB, VacC).
+ACE_METER_VOLTAGE_PATTERNS = [
+    "VacA",
+    "VacB",
+    "VacC",
+]
+
+# Meter phase current column patterns (IacA, IacB, IacC).
+ACE_METER_CURRENT_PATTERNS = [
+    "IacA",
+    "IacB",
+    "IacC",
+]
+
+# Inverter kWh column patterns — case-insensitive substring match.
+# Any column whose header contains one of these strings is treated as a per-inverter
+# energy column. The first \d+ in the column name becomes the inverter number.
+ACE_INVERTER_COLUMN_PATTERNS = [
+    "SMA Inverter",
+]
+
+# Per-site overrides — keyed by sheet name (xlsx) or site_id assigned by the loader (CSV).
+# Sites absent from this dict get the ACE_METER/INVERTER_COLUMN_PATTERNS defaults.
 SITE_CONFIGS: dict = {
     "acedata4": SiteConfig(
         meter_patterns=["SEL-735"],
-        expected_inverters=17,
-        voltage_type="line_to_line",
+        inverter_patterns=["SMA Inverter"],
+    ),
+    # RGM-based site — inverter energy columns are named "RGM 01", "RGM 02", etc.
+    # "Inverters" is used as the meter column (the aggregate kWh reading in this export).
+    "Adams Farm": SiteConfig(
+        meter_patterns=["Inverters"],
+        inverter_patterns=["RGM"],
+    ),
+    "2 Commerce Drive": SiteConfig(
+        inverter_patterns=["INVERTER"],
     ),
 }
 
