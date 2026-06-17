@@ -16,6 +16,46 @@ from src import config
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
+
+# ── Energy-weighted roll-ups ──────────────────────────────────────────────────
+# Reported efficiency and loss % are ALWAYS energy-weighted — the per-interval
+# EFFICIENCY_PCT column exists only for diagnostics (min/max) and must never be
+# averaged with .mean() for a headline figure. Weighting each interval equally
+# would over-count low-energy dawn/dusk intervals; weighting by energy is the only
+# physically correct roll-up. The interval-duration factor cancels, so summing the
+# kW columns is equivalent to summing kWh.
+
+def _weighted_sums(df: pd.DataFrame) -> tuple:
+    """Return (sum_meter_kw, sum_inverter_kw) over intervals where efficiency is defined.
+
+    EFFICIENCY_PCT is NaN exactly when the meter reading is missing or inverter total
+    is non-positive, so masking on it pairs the two sums correctly. Summing each column
+    independently would let a NaN-meter interval still contribute to the inverter sum,
+    inflating the denominator and deflating the reported efficiency.
+    """
+    valid = df[df[config.COL_EFFICIENCY_PCT].notna()]
+    return (
+        valid[config.COL_METER_PRODUCTION_KW].sum(),
+        valid[config.COL_TOTAL_INVERTER_KW].sum(),
+    )
+
+
+def _weighted_efficiency_pct(df: pd.DataFrame) -> float:
+    """Energy-weighted efficiency: 100 * sum(meter_kw) / sum(inverter_kw)."""
+    meter, inv_total = _weighted_sums(df)
+    if inv_total <= 0:
+        return float("nan")
+    return 100.0 * meter / inv_total
+
+
+def _weighted_loss_pct(df: pd.DataFrame) -> float:
+    """Energy-weighted loss %: 100 * (sum(inverter_kw) - sum(meter_kw)) / sum(inverter_kw)."""
+    meter, inv_total = _weighted_sums(df)
+    if inv_total <= 0:
+        return float("nan")
+    return 100.0 * (inv_total - meter) / inv_total
+
+
 # ── Per-site summaries ────────────────────────────────────────────────────────
 
 def summarise_site(record: SiteRecord) -> dict:
@@ -28,11 +68,11 @@ def summarise_site(record: SiteRecord) -> dict:
         "total_raw_rows":     len(record.raw_df),
         "clean_rows":         len(df),
         "clean_row_pct":      round(len(df) / len(record.raw_df) * 100, 2),
-        "avg_efficiency_pct": round(df[config.COL_EFFICIENCY_PCT].mean(), 3),
+        "avg_efficiency_pct": round(_weighted_efficiency_pct(df), 3),
         "min_efficiency_pct": round(df[config.COL_EFFICIENCY_PCT].min(), 3),
         "max_efficiency_pct": round(df[config.COL_EFFICIENCY_PCT].max(), 3),
         "avg_loss_delta_kw":     round(df[config.COL_LOSS_DELTA_KW].mean(), 3),
-        "avg_loss_pct":          round(df[config.COL_LOSS_PCT].mean(), 3),
+        "avg_loss_pct":          round(_weighted_loss_pct(df), 3),
         "total_energy_lost_kwh": round(df[config.COL_ENERGY_LOST_KWH].sum(), 1),
         "date_range_start":      ts.min().date() if not ts.empty else None,
         "date_range_end":        ts.max().date() if not ts.empty else None,
@@ -45,6 +85,9 @@ def summarise_site(record: SiteRecord) -> dict:
 def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
     """Return a DataFrame with one row per (year, month) using all clean intervals."""
     df = record.enriched_df.copy()
+    # Restrict to intervals where efficiency is defined (meter present, inverter > 0)
+    # so the energy-weighted meter/inverter sums below stay paired. See _weighted_sums.
+    df = df[df[config.COL_EFFICIENCY_PCT].notna()]
     ts = pd.to_datetime(df[config.COL_TIMESTAMP])
     df["_year"]  = ts.dt.year
     df["_month"] = ts.dt.month
@@ -53,18 +96,23 @@ def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
         df.groupby(["_year", "_month"])
         .agg(
             row_count=(config.COL_EFFICIENCY_PCT, "count"),
-            avg_efficiency_pct=(config.COL_EFFICIENCY_PCT, "mean"),
             min_efficiency_pct=(config.COL_EFFICIENCY_PCT, "min"),
             max_efficiency_pct=(config.COL_EFFICIENCY_PCT, "max"),
             avg_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "mean"),
-            avg_loss_pct=(config.COL_LOSS_PCT, "mean"),
             total_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "sum"),
             total_energy_lost_kwh=(config.COL_ENERGY_LOST_KWH, "sum"),
+            _sum_meter_kw=(config.COL_METER_PRODUCTION_KW, "sum"),
+            _sum_inverter_kw=(config.COL_TOTAL_INVERTER_KW, "sum"),
         )
         .reset_index()
         .sort_values(["_year", "_month"])
         .reset_index(drop=True)
     )
+
+    # Energy-weighted efficiency and loss % per month (not a mean of per-interval ratios).
+    inv_pos = agg["_sum_inverter_kw"].where(agg["_sum_inverter_kw"] > 0)
+    agg["avg_efficiency_pct"] = 100.0 * agg["_sum_meter_kw"] / inv_pos
+    agg["avg_loss_pct"] = 100.0 * (agg["_sum_inverter_kw"] - agg["_sum_meter_kw"]) / inv_pos
 
     if agg.empty:
         return pd.DataFrame(columns=["Month", "Valid Readings", "Average Efficiency (%)",
@@ -98,18 +146,24 @@ def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
 def summarise_by_time_bucket(record: SiteRecord) -> pd.DataFrame:
     """Return a DataFrame with one row per time bucket (excluding 'Other')."""
     df = record.enriched_df
-    df = df[df[config.COL_TIME_BUCKET] != "Other"]
+    # Keep only efficiency-defined intervals so the energy-weighted sums stay paired.
+    df = df[(df[config.COL_TIME_BUCKET] != "Other") & df[config.COL_EFFICIENCY_PCT].notna()]
 
     agg = (
         df.groupby(config.COL_TIME_BUCKET)
         .agg(
             row_count=(config.COL_EFFICIENCY_PCT, "count"),
-            avg_efficiency_pct=(config.COL_EFFICIENCY_PCT, "mean"),
             avg_loss_delta_kw=(config.COL_LOSS_DELTA_KW, "mean"),
+            _sum_meter_kw=(config.COL_METER_PRODUCTION_KW, "sum"),
+            _sum_inverter_kw=(config.COL_TOTAL_INVERTER_KW, "sum"),
         )
         .reset_index()
         .rename(columns={config.COL_TIME_BUCKET: "time_bucket"})
     )
+
+    # Energy-weighted efficiency per time bucket (not a mean of per-interval ratios).
+    inv_pos = agg["_sum_inverter_kw"].where(agg["_sum_inverter_kw"] > 0)
+    agg["avg_efficiency_pct"] = 100.0 * agg["_sum_meter_kw"] / inv_pos
 
     float_cols = ["avg_efficiency_pct", "avg_loss_delta_kw"]
     agg[float_cols] = agg[float_cols].round(3)
@@ -212,7 +266,7 @@ def _phase_sensitivity(record: SiteRecord) -> list:
         rows.append({
             "threshold_pct":     pct,
             "rows_kept":         len(df),
-            "avg_efficiency_pct": round(enriched[config.COL_EFFICIENCY_PCT].mean(), 2),
+            "avg_efficiency_pct": round(_weighted_efficiency_pct(enriched), 2),
         })
     return rows
 

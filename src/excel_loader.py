@@ -126,6 +126,7 @@ _NON_INVERTER_SUBSTRINGS = {
 
 
 def _is_non_inverter_col(col: str) -> bool:
+    """Return True if col should never be treated as a per-inverter energy channel."""
     lc = col.lower()
     return any(excl in lc for excl in _NON_INVERTER_SUBSTRINGS)
 
@@ -163,6 +164,8 @@ def _auto_detect_inverter_cols(df: pd.DataFrame, exclude: str) -> list:
         if numeric.isna().all():
             continue
         nonzero = numeric[numeric != 0]
+        # Exclude columns whose non-zero values are all negligibly small — catches
+        # status-flag columns that happen to contain occasional 0/1 integers.
         if nonzero.empty or nonzero.median() == 0:
             continue
         valid.append(c)
@@ -199,16 +202,17 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
 
     Timestamps are Excel serial date floats — converted via origin='1899-12-30'.
 
-    Meter kWh column discovered by pattern match (site config or ACE_METER_COLUMN_PATTERNS
-    fallback); converted to kW as kWh / interval_hours.
+    Meter kWh column discovered by keyword scan (_auto_detect_meter_col); converted
+    to average power as kWh × (60 / INTERVAL_MINUTES).
 
-    Per-inverter kWh columns discovered via site config inverter_patterns (falls back to
-    ACE_INVERTER_COLUMN_PATTERNS). The first run of digits in the matching column name
-    becomes the inverter number; each column is converted to 'Inverter N AC kW'.
-    cleaners.py detects these derived columns via regex for the cross-inverter imbalance check.
+    Per-inverter kWh columns discovered by _auto_detect_inverter_cols (columns whose
+    name contains 'inverter', after excluding known non-inverter substrings). Each
+    column is converted to 'Inverter N AC kW'. Multiple columns sharing the same
+    inverter number are summed before conversion. cleaners.py and calculator.py
+    discover these derived columns via the regex ^Inverter \\d+ AC kW$.
 
-    Meter phase voltage (VacA/B/C) and current (IacA/B/C) columns are coerced to numeric
-    and passed through as raw columns for downstream use.
+    Meter phase voltage (VacA/B/C) and current (IacA/B/C) columns are coerced to
+    numeric and passed through as raw columns for downstream phase-imbalance checks.
     """
     df = df.copy()
 
@@ -277,7 +281,7 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
                     if m:
                         num = int(m.group())
                         seen_nums.setdefault(num, []).append(c)
-                    break
+                    break  # one pattern match per column is enough
         inv_kwh_matches = sorted(seen_nums.items(), key=lambda x: x[0])
         if not inv_kwh_matches:
             raise ValueError(
@@ -287,6 +291,8 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
 
     n_inv = len(inv_kwh_matches)
     for inv_num, kwh_cols in inv_kwh_matches:
+        # Sum all source columns for this inverter number (handles multi-string inverters),
+        # then convert from per-interval kWh to average kW.
         kw = sum(pd.to_numeric(df[c], errors="coerce") for c in kwh_cols)
         df[f"Inverter {inv_num} AC kW"] = (kw * kw_factor).fillna(0.0)
 

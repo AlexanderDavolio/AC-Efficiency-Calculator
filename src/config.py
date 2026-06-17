@@ -41,6 +41,7 @@ COL_TIME_BUCKET = "TIME_BUCKET"
 # ── Cleaning thresholds ─────────────────────────────────────────────────────
 
 # Rows where meter production is strictly below this value are nighttime / offline.
+# 1 kW rather than 0 to absorb meter noise and pre-dawn ramp artefacts.
 NIGHTTIME_KW_THRESHOLD = 1.0
 
 # (max - min) / mean per signal group must not exceed these ratios.
@@ -50,15 +51,23 @@ CURRENT_IMBALANCE_THRESHOLD  = 0.50   # per-inverter AC current (loose — catch
 VOLTAGE_IMBALANCE_THRESHOLD  = 0.05   # per-inverter AC voltage (tight — voltage should always match grid)
 INVERTER_IMBALANCE_THRESHOLD = 0.50   # per-inverter computed kW (loose — mirrors current threshold)
 
-# Inline-calculated efficiency bounds. Rows outside [MIN, MAX] are gross outliers.
-MIN_EFFICIENCY_PCT = 80.0
-MAX_EFFICIENCY_PCT = 100.0
+# Inline-calculated per-interval efficiency bounds. Rows outside [MIN, MAX] are
+# discarded as sensor/CT garbage (dead meter, miswired CT), NOT real losses.
+# This is a wide sensor-sanity band, not a performance band: individual intervals
+# routinely read slightly over 100% due to meter/inverter interval-boundary timing
+# jitter, and those are legitimate — they wash out under energy weighting. Keeping
+# a tight band here (e.g. an exact 100% ceiling) would discard ~31% of valid
+# high-production daytime intervals. Roll-up efficiency is energy-weighted, so
+# only genuinely impossible readings need to be filtered at the interval level.
+MIN_EFFICIENCY_PCT = 50.0
+MAX_EFFICIENCY_PCT = 150.0
 
 # Allowed deviation from equal inverter power share before flagging as imbalanced.
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.
 INVERTER_IMBALANCE_TOLERANCE_PP = 5
 
 # Minimum fraction of expected daylight intervals that must be clean for a day to be "good".
+# "Daylight" = intervals that survive the nighttime filter (meter > NIGHTTIME_KW_THRESHOLD).
 # Days below this threshold are excluded from monthly and overall efficiency averages.
 GOOD_DAY_MIN_CLEAN_PCT = 0.70
 
@@ -89,6 +98,7 @@ ACE_METER_CURRENT_PATTERNS = [
 # Inverter kWh column patterns — case-insensitive substring match.
 # Any column whose header contains one of these strings is treated as a per-inverter
 # energy column. The first \d+ in the column name becomes the inverter number.
+# Empty: all sites currently use auto-detection in excel_loader._auto_detect_inverter_cols.
 ACE_INVERTER_COLUMN_PATTERNS = []
 
 # Per-site overrides — keyed by sheet name (xlsx) or site_id assigned by the loader (CSV).

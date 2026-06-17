@@ -42,7 +42,11 @@ def _raw_inverter_cols(df: pd.DataFrame, site_id: str = "") -> list:
 
 
 def filter_inverter_active(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
-    """Drop rows where any inverter reports zero or negative kWh (offline or nighttime)."""
+    """Drop rows where any inverter reports zero or negative kW (nighttime or comms dropout).
+
+    Zero catches nighttime; negative catches inverters that report −1 or similar sentinel
+    values during communication failures.
+    """
     before = len(df)
     raw_cols = _raw_inverter_cols(df, site_id)
     mask = (df[raw_cols] > 0).all(axis=1)
@@ -54,7 +58,13 @@ def filter_inverter_active(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
 
 
 def filter_gross_outliers(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
-    """Drop rows where inline-calculated efficiency is outside [MIN_EFFICIENCY_PCT, MAX_EFFICIENCY_PCT].
+    """Drop rows whose per-interval efficiency is outside the sensor-sanity band
+    [MIN_EFFICIENCY_PCT, MAX_EFFICIENCY_PCT].
+
+    This is a wide band (50–150%) meant to remove only physically impossible readings
+    (dead meter, miswired CT). Intervals reading slightly over 100% from meter/inverter
+    timing jitter are legitimate and intentionally retained — they wash out under the
+    energy-weighted roll-ups in the reporter.
 
     Efficiency = meter_kw / total_inverter_kw * 100. Rows where inverter total is <= 0
     produce NaN efficiency and are kept — caught upstream by filter_inverter_active.

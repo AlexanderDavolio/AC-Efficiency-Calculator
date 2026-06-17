@@ -11,17 +11,26 @@ _INV_KW_COL_RE = re.compile(r"^Inverter \d+ AC kW$")
 
 
 def _inverter_kw_cols(df: pd.DataFrame) -> list:
+    """Return all 'Inverter N AC kW' columns sorted by inverter number."""
     cols = [c for c in df.columns if _INV_KW_COL_RE.match(c)]
     return sorted(cols, key=lambda c: int(re.search(r"\d+", c).group()))
 
 
 def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
-    """Add INVERTER_TOTAL_KW and EFFICIENCY_PCT columns to the DataFrame."""
+    """Add INVERTER_TOTAL_KW and EFFICIENCY_PCT columns to the DataFrame.
+
+    efficiency_pct = (meter_kw / inverter_total_kw) × 100
+
+    Values < 100% represent AC losses between inverter terminals and the meter
+    (wiring, transformer, etc.). Values > 100% indicate a data error — these rows
+    are removed by filter_gross_outliers. Rows where inverter total is zero or
+    negative produce NaN efficiency and are removed by filter_inverter_active.
+    """
     df = df.copy()
 
     df[config.COL_TOTAL_INVERTER_KW] = df[_inverter_kw_cols(df)].sum(axis=1)
 
-    # Only divide where inverter total is positive; undefined rows become NaN.
+    # Guard against divide-by-zero; rows with non-positive inverter total become NaN.
     df[config.COL_EFFICIENCY_PCT] = (
         df[config.COL_METER_PRODUCTION_KW]
         / df[config.COL_TOTAL_INVERTER_KW].where(df[config.COL_TOTAL_INVERTER_KW] > 0)
@@ -32,10 +41,14 @@ def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_loss_delta(df: pd.DataFrame) -> pd.DataFrame:
-    """Add LOSS_DELTA_KW column: inverter total minus meter production.
+    """Add LOSS_DELTA_KW, LOSS_PCT, and ENERGY_LOST_KWH columns.
 
-    Positive = inverters produced more than the meter recorded (expected losses).
-    Negative = meter reads higher than inverters, which warrants investigation.
+    loss_delta_kw  = inverter_total_kw − meter_kw  (positive = expected loss)
+    loss_pct       = loss_delta_kw / inverter_total_kw × 100
+    energy_lost_kwh = loss_delta_kw × (INTERVAL_MINUTES / 60)
+
+    Negative loss_delta means the meter reads higher than inverters, which warrants
+    investigation (likely a sensor fault or meter/inverter mismatch).
     Requires calculate_efficiency to have run first so INVERTER_TOTAL_KW exists.
     """
     df = df.copy()
@@ -81,7 +94,14 @@ def run_all_calculations(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_loss_delta(df)
     df = add_time_buckets(df)
 
-    avg_eff = df[config.COL_EFFICIENCY_PCT].mean()
+    # Energy-weighted efficiency: sum(meter_kw) / sum(inverter_kw), NOT the mean of
+    # per-interval ratios. Each interval is weighted by the energy it carried, which is
+    # the only physically meaningful roll-up. The interval-duration factor cancels, so
+    # summing kW is equivalent to summing kWh. Mask on EFFICIENCY_PCT (NaN when meter is
+    # missing or inverter <= 0) so the two sums stay paired over the same intervals.
+    valid = df[df[config.COL_EFFICIENCY_PCT].notna()]
+    inv_total = valid[config.COL_TOTAL_INVERTER_KW].sum()
+    avg_eff = 100.0 * valid[config.COL_METER_PRODUCTION_KW].sum() / inv_total if inv_total > 0 else float("nan")
     avg_loss = df[config.COL_LOSS_DELTA_KW].mean()
     print(
         f"[calculator] avg efficiency : {avg_eff:.2f}%"
