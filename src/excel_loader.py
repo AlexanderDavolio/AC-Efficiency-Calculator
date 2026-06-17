@@ -116,24 +116,47 @@ def _auto_detect_meter_col(cols: list) -> str:
     return None
 
 
-_NON_INVERTER_COLS = {
-    "timestamp", "inverters", "site performance estimate",
-    "power factor phase angle", "average ac voltage", "total ac current",
+_NON_INVERTER_SUBSTRINGS = {
+    "timestamp", "inverters",  # "inverters" plural = aggregate; "inverter" singular = individual channel
+    "site performance estimate",
+    "power factor", "average ac voltage", "total ac current",
     "vaca", "vacb", "vacc", "vacab", "vacbc", "vacca",
     "iaca", "iacb", "iacc",
 }
 
+
+def _is_non_inverter_col(col: str) -> bool:
+    lc = col.lower()
+    return any(excl in lc for excl in _NON_INVERTER_SUBSTRINGS)
+
+
 def _auto_detect_inverter_cols(df: pd.DataFrame, exclude: str) -> list:
     """Return columns that look like per-interval inverter kWh readings.
 
-    Drops the meter column, known metadata columns, columns with no numeric data,
-    and columns whose non-zero values have a median of 0 (effectively all-zero).
-    Remaining candidates are numbered 1, 2, 3... in column order.
+    Primary path: columns whose name contains 'inverter' (matches every known
+    naming convention: "INVERTER 1", "Sungrow 60KW Inverter - A1", etc.) after
+    removing the meter column and known non-inverter substrings via substring match.
+
+    Fallback: if no 'inverter'-named columns survive, broaden to all remaining
+    numeric columns and log a warning — handles sites with atypical naming.
+
+    Remaining candidates are numbered 1, 2, 3… in column order.
     """
-    candidates = [
+    pre_filter = [
         c for c in df.columns
-        if c != exclude and c.lower() not in _NON_INVERTER_COLS
+        if c != exclude and not _is_non_inverter_col(c)
     ]
+
+    # Prefer columns explicitly named "inverter" — catches all known conventions.
+    inv_named = [c for c in pre_filter if "inverter" in c.lower()]
+    candidates = inv_named if inv_named else pre_filter
+
+    if not inv_named and pre_filter:
+        print(
+            f"[excel_loader] WARNING: no columns containing 'inverter' found — "
+            f"falling back to broad numeric scan ({len(pre_filter)} candidate(s))"
+        )
+
     valid = []
     for c in candidates:
         numeric = pd.to_numeric(df[c], errors="coerce")
