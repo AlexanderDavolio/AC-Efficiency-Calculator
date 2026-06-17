@@ -27,6 +27,7 @@ Returns the same List[SiteRecord] contract as csv_loader.load_all_sites().
 
 import io
 import re
+import traceback
 import zipfile
 import pandas as pd
 from pathlib import Path
@@ -170,7 +171,17 @@ def _auto_detect_inverter_cols(df: pd.DataFrame, exclude: str) -> list:
 
 
 _INTERVAL_TOLERANCE_MIN = 2
-_CUMULATIVE_MEDIAN_THRESHOLD_KWH = 100  # above this, a column is likely cumulative lifetime energy
+# If more than this fraction of consecutive row-to-row differences are positive, the column
+# is treated as a daily running total (cumulative) rather than a per-interval reading.
+_MONOTONIC_INCREASE_THRESHOLD = 0.90
+
+
+def _appears_cumulative(series: pd.Series) -> bool:
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    diffs = numeric.diff().dropna()
+    if len(diffs) < 2:
+        return False
+    return (diffs > 0).sum() / len(diffs) > _MONOTONIC_INCREASE_THRESHOLD
 
 
 def _validate_intervals(df: pd.DataFrame, site_id: str) -> None:
@@ -288,18 +299,30 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
 
     # ── Cumulative-column sanity check ───────────────────────────────────────
     all_source_cols = [c for _, cols in inv_kwh_matches for c in cols]
-    if any(
-        pd.to_numeric(df[c], errors="coerce").median() > _CUMULATIVE_MEDIAN_THRESHOLD_KWH
-        for c in all_source_cols
-    ):
+    print(f"[DEBUG cumulative] site='{site_id}' all_source_cols={all_source_cols}")
+    _cumulative_flags: dict = {}
+    for _c in all_source_cols:
+        try:
+            _numeric = pd.to_numeric(df[_c], errors="coerce").dropna()
+            print(f"[DEBUG cumulative] '{_c}' first 5 values: {list(_numeric.head(5))}")
+            _diffs = _numeric.diff().dropna()
+            _frac = ((_diffs > 0).sum() / len(_diffs)) if len(_diffs) >= 2 else float("nan")
+            _flagged = _appears_cumulative(df[_c])
+            print(f"[DEBUG cumulative] '{_c}': pos_diff_frac={_frac:.3f}, flagged={_flagged}")
+            _cumulative_flags[_c] = _flagged
+        except Exception as _exc:
+            print(f"[DEBUG cumulative] '{_c}': EXCEPTION in _appears_cumulative — {_exc}")
+            traceback.print_exc()
+            _cumulative_flags[_c] = False
+    if any(_cumulative_flags.values()):
         fallback = next(
             (c for c in df.columns if c.lower() == "inverters" and c != meter_col), None
         )
         if fallback is None:
             raise ValueError(
                 f"[excel_loader] ACE site '{site_id}': inverter columns appear cumulative "
-                f"(median > {_CUMULATIVE_MEDIAN_THRESHOLD_KWH} kWh) and no 'Inverters' "
-                f"fallback column found"
+                f"(>{_MONOTONIC_INCREASE_THRESHOLD:.0%} of row-to-row diffs are positive) "
+                f"and no 'Inverters' fallback column found"
             )
         print(
             f"[excel_loader] WARNING '{site_id}': inverter columns appear cumulative — "
