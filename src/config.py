@@ -52,7 +52,7 @@ INVERTER_IMBALANCE_THRESHOLD = 0.50   # per-inverter computed kW (loose — mirr
 
 # Inline-calculated efficiency bounds. Rows outside [MIN, MAX] are gross outliers.
 MIN_EFFICIENCY_PCT = 80.0
-MAX_EFFICIENCY_PCT = 110.0
+MAX_EFFICIENCY_PCT = 100.0
 
 # Allowed deviation from equal inverter power share before flagging as imbalanced.
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.
@@ -89,30 +89,11 @@ ACE_METER_CURRENT_PATTERNS = [
 # Inverter kWh column patterns — case-insensitive substring match.
 # Any column whose header contains one of these strings is treated as a per-inverter
 # energy column. The first \d+ in the column name becomes the inverter number.
-ACE_INVERTER_COLUMN_PATTERNS = [
-    "SMA Inverter",
-]
+ACE_INVERTER_COLUMN_PATTERNS = []
 
 # Per-site overrides — keyed by sheet name (xlsx) or site_id assigned by the loader (CSV).
-# Sites absent from this dict get the ACE_METER/INVERTER_COLUMN_PATTERNS defaults.
-SITE_CONFIGS: dict = {
-    "acedata4": SiteConfig(
-        meter_patterns=["SEL-735"],
-        inverter_patterns=["SMA Inverter"],
-    ),
-    # RGM-based site — inverter energy columns are named "RGM 01", "RGM 02", etc.
-    # "Inverters" is used as the meter column (the aggregate kWh reading in this export).
-    "Adams Farm": SiteConfig(
-        meter_patterns=["Inverters"],
-        inverter_patterns=["RGM"],
-    ),
-    "2 Commerce Drive": SiteConfig(
-        inverter_patterns=["INVERTER"],
-    ),
-    "2 Executive Drive": SiteConfig(
-        inverter_patterns=["INVERTER"],
-    ),
-}
+# Sites absent from this dict use auto-detection for meter and inverter columns.
+SITE_CONFIGS: dict = {}
 
 # Hidden flag column written by the loader; True for rows where any inverter's phase
 # currents (IacA/B/C) exceed the imbalance threshold.

@@ -95,7 +95,59 @@ def _find_meter_col(cols, patterns: list) -> str:
     return None
 
 
+def _auto_detect_meter_col(cols: list) -> str:
+    """Broad meter detection for sites not in SITE_CONFIGS.
+
+    Tries priority keywords first; falls back to any kWh column without a digit
+    (likely an aggregate total rather than a per-inverter channel).
+    """
+    lower_map = {c.lower(): c for c in cols}
+    for kw in ("production", "net energy", "meter", "net kwh"):
+        for lc, orig in lower_map.items():
+            if kw in lc:
+                return orig
+    # Generic kWh fallback — prefer columns without digits (not per-inverter)
+    for lc, orig in lower_map.items():
+        if "kwh" in lc and not re.search(r"\d", lc):
+            return orig
+    for lc, orig in lower_map.items():
+        if "kwh" in lc:
+            return orig
+    return None
+
+
+_NON_INVERTER_COLS = {
+    "timestamp", "inverters", "site performance estimate",
+    "power factor phase angle", "average ac voltage", "total ac current",
+    "vaca", "vacb", "vacc", "vacab", "vacbc", "vacca",
+    "iaca", "iacb", "iacc",
+}
+
+def _auto_detect_inverter_cols(df: pd.DataFrame, exclude: str) -> list:
+    """Return columns that look like per-interval inverter kWh readings.
+
+    Drops the meter column, known metadata columns, columns with no numeric data,
+    and columns whose non-zero values have a median of 0 (effectively all-zero).
+    Remaining candidates are numbered 1, 2, 3... in column order.
+    """
+    candidates = [
+        c for c in df.columns
+        if c != exclude and c.lower() not in _NON_INVERTER_COLS
+    ]
+    valid = []
+    for c in candidates:
+        numeric = pd.to_numeric(df[c], errors="coerce")
+        if numeric.isna().all():
+            continue
+        nonzero = numeric[numeric != 0]
+        if nonzero.empty or nonzero.median() == 0:
+            continue
+        valid.append(c)
+    return [(i + 1, [c]) for i, c in enumerate(valid)]
+
+
 _INTERVAL_TOLERANCE_MIN = 2
+_CUMULATIVE_MEDIAN_THRESHOLD_KWH = 100  # above this, a column is likely cumulative lifetime energy
 
 
 def _validate_intervals(df: pd.DataFrame, site_id: str) -> None:
@@ -139,16 +191,6 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
     df = df.copy()
 
     site_cfg = config.SITE_CONFIGS.get(site_id)
-    meter_patterns = (
-        site_cfg.meter_patterns
-        if site_cfg and site_cfg.meter_patterns is not None
-        else config.ACE_METER_COLUMN_PATTERNS
-    )
-    inv_patterns = (
-        site_cfg.inverter_patterns
-        if site_cfg and site_cfg.inverter_patterns is not None
-        else config.ACE_INVERTER_COLUMN_PATTERNS
-    )
 
     # Convert timestamps — openpyxl may already parse date cells as datetime objects;
     # fall back to Excel serial date float conversion if direct parsing yields all NaT.
@@ -163,40 +205,89 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
 
     kw_factor = 60.0 / config.INTERVAL_MINUTES  # kWh → kW for INTERVAL_MINUTES-min readings
 
-    # Discover meter kWh column and convert to kW
-    meter_col = _find_meter_col(df.columns, meter_patterns)
-    if meter_col is None:
-        raise ValueError(
-            f"[excel_loader] ACE site '{site_id}': no meter column matched {meter_patterns}"
+    # ── Meter column detection ────────────────────────────────────────────────
+    if site_cfg is None:
+        meter_col = _auto_detect_meter_col(list(df.columns))
+        if meter_col:
+            print(f"[excel_loader] auto-detect '{site_id}': using '{meter_col}' as meter column")
+        else:
+            raise ValueError(
+                f"[excel_loader] ACE site '{site_id}': could not auto-detect meter column"
+            )
+    else:
+        meter_patterns = (
+            site_cfg.meter_patterns if site_cfg.meter_patterns is not None
+            else config.ACE_METER_COLUMN_PATTERNS
         )
+        meter_col = _find_meter_col(df.columns, meter_patterns)
+        if meter_col is None:
+            raise ValueError(
+                f"[excel_loader] ACE site '{site_id}': no meter column matched {meter_patterns}"
+            )
+
     df[config.COL_METER_PRODUCTION_KW] = (
         pd.to_numeric(df[meter_col], errors="coerce") * kw_factor
     )
 
-    # Discover per-inverter kWh columns via site-configured patterns; extract inverter
-    # number from the first run of digits in each matching column name.
-    seen_nums: dict = {}
-    for c in df.columns:
-        c_lc = c.lower()
-        for pat in inv_patterns:
-            if pat.lower() in c_lc:
-                m = re.search(r"\d+", c)
-                if m:
-                    num = int(m.group())
-                    if num not in seen_nums:
-                        seen_nums[num] = c
-                break
-    inv_kwh_matches = sorted(seen_nums.items(), key=lambda x: x[0])
-    if not inv_kwh_matches:
-        raise ValueError(
-            f"[excel_loader] ACE site '{site_id}': no inverter kWh columns found "
-            f"(patterns searched: {inv_patterns})"
+    # ── Inverter column detection ─────────────────────────────────────────────
+    if site_cfg is None:
+        inv_kwh_matches = _auto_detect_inverter_cols(df, meter_col)
+        if inv_kwh_matches:
+            print(
+                f"[excel_loader] auto-detect '{site_id}': found {len(inv_kwh_matches)} "
+                f"inverter column(s) via broad kWh scan"
+            )
+        else:
+            raise ValueError(
+                f"[excel_loader] ACE site '{site_id}': could not auto-detect inverter columns"
+            )
+    else:
+        inv_patterns = (
+            site_cfg.inverter_patterns if site_cfg.inverter_patterns is not None
+            else config.ACE_INVERTER_COLUMN_PATTERNS
         )
+        seen_nums: dict = {}
+        for c in df.columns:
+            c_lc = c.lower()
+            for pat in inv_patterns:
+                if pat.lower() in c_lc:
+                    m = re.search(r"\d+", c)
+                    if m:
+                        num = int(m.group())
+                        seen_nums.setdefault(num, []).append(c)
+                    break
+        inv_kwh_matches = sorted(seen_nums.items(), key=lambda x: x[0])
+        if not inv_kwh_matches:
+            raise ValueError(
+                f"[excel_loader] ACE site '{site_id}': no inverter kWh columns found "
+                f"(patterns searched: {inv_patterns})"
+            )
+
+    # ── Cumulative-column sanity check ───────────────────────────────────────
+    all_source_cols = [c for _, cols in inv_kwh_matches for c in cols]
+    if any(
+        pd.to_numeric(df[c], errors="coerce").median() > _CUMULATIVE_MEDIAN_THRESHOLD_KWH
+        for c in all_source_cols
+    ):
+        fallback = next(
+            (c for c in df.columns if c.lower() == "inverters" and c != meter_col), None
+        )
+        if fallback is None:
+            raise ValueError(
+                f"[excel_loader] ACE site '{site_id}': inverter columns appear cumulative "
+                f"(median > {_CUMULATIVE_MEDIAN_THRESHOLD_KWH} kWh) and no 'Inverters' "
+                f"fallback column found"
+            )
+        print(
+            f"[excel_loader] WARNING '{site_id}': inverter columns appear cumulative — "
+            f"falling back to '{fallback}'"
+        )
+        inv_kwh_matches = [(1, [fallback])]
 
     n_inv = len(inv_kwh_matches)
-    for inv_num, kwh_col in inv_kwh_matches:
-        df[kwh_col] = pd.to_numeric(df[kwh_col], errors="coerce")
-        df[f"Inverter {inv_num} AC kW"] = (df[kwh_col] * kw_factor).fillna(0.0)
+    for inv_num, kwh_cols in inv_kwh_matches:
+        kw = sum(pd.to_numeric(df[c], errors="coerce") for c in kwh_cols)
+        df[f"Inverter {inv_num} AC kW"] = (kw * kw_factor).fillna(0.0)
 
     # Coerce meter phase voltage and current columns to numeric; pass through as raw
     for pat in config.ACE_METER_VOLTAGE_PATTERNS + config.ACE_METER_CURRENT_PATTERNS:
@@ -253,7 +344,7 @@ def load_workbook(xlsx_path: Path) -> List[SiteRecord]:
         if site_id not in config.SITE_CONFIGS:
             print(
                 f"[excel_loader] WARNING: site '{site_id}' not found in SITE_CONFIGS — "
-                f"add an entry to config.py to configure meter/inverter patterns"
+                f"attempting auto-detection of meter/inverter columns"
             )
 
         # Strip column name whitespace so comparisons against config constants work.

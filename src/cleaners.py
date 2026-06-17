@@ -19,25 +19,26 @@ def _inverter_kw_cols(df: pd.DataFrame) -> list:
 
 
 def _raw_inverter_cols(df: pd.DataFrame, site_id: str = "") -> list:
-    """Return raw inverter kWh column names sorted by inverter number using site config patterns."""
+    """Return raw inverter kWh column names sorted by inverter number.
+
+    For unknown sites (or when SITE_CONFIGS is empty), returns the derived
+    'Inverter N AC kW' columns that the loader already emitted — no raw re-detection needed.
+    """
     site_cfg = config.SITE_CONFIGS.get(site_id)
-    inv_patterns = (
-        site_cfg.inverter_patterns
-        if site_cfg and site_cfg.inverter_patterns is not None
-        else config.ACE_INVERTER_COLUMN_PATTERNS
-    )
+    if site_cfg is None or site_cfg.inverter_patterns is None:
+        return _inverter_kw_cols(df)
+
     seen: dict = {}
     for c in df.columns:
         c_lc = c.lower()
-        for pat in inv_patterns:
+        for pat in site_cfg.inverter_patterns:
             if pat.lower() in c_lc:
                 m = re.search(r"\d+", c)
                 if m:
                     num = int(m.group())
-                    if num not in seen:
-                        seen[num] = c
+                    seen.setdefault(num, []).append(c)
                 break
-    return [c for _, c in sorted(seen.items(), key=lambda x: x[0])]
+    return [c for _, cols in sorted(seen.items()) for c in cols]
 
 
 def filter_inverter_active(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:

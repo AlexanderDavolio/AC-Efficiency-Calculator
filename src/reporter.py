@@ -1,11 +1,14 @@
 """Output layer: per-site cleaned CSVs and console tables."""
 
 import calendar
+import contextlib
+import io
 import re
 from pathlib import Path
 from typing import List
 
 import pandas as pd
+from tabulate import tabulate
 
 from src.models import SiteRecord
 from src import config
@@ -172,33 +175,86 @@ def write_cleaned_csv(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
+def _phase_sensitivity(record: SiteRecord) -> list:
+    """Return avg efficiency for phase thresholds 1–5%, running the full filter+calc pipeline.
+
+    The phase imbalance filter is reproduced inline here so cleaners.py stays unchanged.
+    """
+    from src.cleaners import filter_inverter_active, filter_gross_outliers
+    from src.calculator import run_all_calculations
+
+    def _apply_phase_filter(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+        lower_map = {c.lower(): c for c in df.columns}
+        flag = pd.Series(False, index=df.index)
+        for patterns in (config.ACE_METER_VOLTAGE_PATTERNS, config.ACE_METER_CURRENT_PATTERNS):
+            present = []
+            for pat in patterns:
+                match = next((orig for lc, orig in lower_map.items() if pat.lower() in lc), None)
+                if match:
+                    present.append(match)
+            if len(present) < 2:
+                continue
+            vals = df[present]
+            mean = vals.mean(axis=1)
+            devs = vals.sub(mean, axis=0).abs().div(mean.where(mean != 0), axis=0)
+            flag |= (devs > threshold).any(axis=1).fillna(False)
+        return df[~flag].copy()
+
+    sink = io.StringIO()
+    rows = []
+    for pct in range(1, 6):
+        threshold = pct / 100
+        with contextlib.redirect_stdout(sink):
+            df = _apply_phase_filter(record.raw_df, threshold)
+            df = filter_inverter_active(df, record.site_id)
+            df = filter_gross_outliers(df, record.site_id)
+            enriched = run_all_calculations(df)
+        rows.append({
+            "threshold_pct":     pct,
+            "rows_kept":         len(df),
+            "avg_efficiency_pct": round(enriched[config.COL_EFFICIENCY_PCT].mean(), 2),
+        })
+    return rows
+
+
+def _print_sensitivity_table(all_sens: dict) -> None:
+    """Print a threshold × site sensitivity table using tabulate.
+
+    all_sens: {site_name: [{"threshold_pct": int, "avg_efficiency_pct": float}, ...]}
+    """
+    sites = list(all_sens.keys())
+    rows = []
+    for pct in range(1, 6):
+        row = [f"{pct}%"]
+        for site in sites:
+            entry = next((r for r in all_sens[site] if r["threshold_pct"] == pct), None)
+            eff = entry["avg_efficiency_pct"] if entry else float("nan")
+            row.append(f"{eff:.2f}%" if pd.notna(eff) else "nan%")
+        rows.append(row)
+    headers = ["Threshold"] + sites
+    print(f"  Phase Imbalance Sensitivity (All Sites)")
+    print(tabulate(rows, headers=headers, tablefmt="simple", colalign=("right",) + ("right",) * len(sites)))
+    print()
+
+
 def _print_summary_table(summaries: list) -> None:
     """Print a one-row-per-site summary table."""
-    print(f"\n{'='*158}")
+    print(f"\n{'='*86}")
     print(f"  Summary")
-    print(f"{'='*158}")
-    print(f"  {'Site':<22}  {'Date Range':<23}  {'Total Raw Intervals':>20}  {'Data Coverage %':>16}  {'Clean Intervals':>16}  {'Avg Efficiency':>16}  {'Avg Loss Delta':>16}  {'Loss % of Output':>18}  {'Total Energy Lost':>20}")
-    print(f"  {'-'*22}  {'-'*23}  {'-'*20}  {'-'*16}  {'-'*16}  {'-'*16}  {'-'*16}  {'-'*18}  {'-'*20}")
+    print(f"{'='*86}")
+    print(f"  {'Site':<22}  {'Date Range':<23}  {'Avg Efficiency':>16}  {'Total Energy Lost':>20}")
+    print(f"  {'-'*22}  {'-'*23}  {'-'*16}  {'-'*20}")
     for s in summaries:
         date_range   = (
             f"{s['date_range_start']} – {s['date_range_end']}"
             if s["date_range_start"] else "N/A"
         )
-        coverage_pct = s["clean_rows"] / s["total_raw_rows"] * 100 if s["total_raw_rows"] else float("nan")
         avg_eff      = s["avg_efficiency_pct"]
-        avg_loss     = s["avg_loss_delta_kw"]
-        avg_loss_pct = s["avg_loss_pct"]
         total_energy = s["total_energy_lost_kwh"]
-        eff_str      = f"{avg_eff:>15.2f}%"         if pd.notna(avg_eff)      else f"{'N/A':>15} "
-        loss_str     = f"{avg_loss:>14.3f} kW"      if pd.notna(avg_loss)     else f"{'N/A':>14}   "
-        loss_pct_str = f"{avg_loss_pct:>15.2f}%"    if pd.notna(avg_loss_pct) else f"{'N/A':>15} "
-        energy_str   = f"{total_energy:>16.1f} kWh" if pd.notna(total_energy) else f"{'N/A':>16}    "
-        print(
-            f"  {s['site_name']:<22}  {date_range:<23}  "
-            f"{s['total_raw_rows']:>20,}  {coverage_pct:>15.1f}%  "
-            f"{s['clean_rows']:>16,}  {eff_str}  {loss_str}  {loss_pct_str}  {energy_str}"
-        )
-    print(f"{'='*158}\n")
+        eff_str    = f"{avg_eff:>15.2f}%"         if pd.notna(avg_eff)      else f"{'N/A':>15} "
+        energy_str = f"{total_energy:>16.1f} kWh" if pd.notna(total_energy) else f"{'N/A':>16}    "
+        print(f"  {s['site_name']:<22}  {date_range:<23}  {eff_str}  {energy_str}")
+    print(f"{'='*86}\n")
 
 
 def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) -> None:
@@ -208,6 +264,7 @@ def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) ->
         return
 
     all_summaries = []
+    all_sens: dict = {}
 
     for r in records:
         summary = summarise_site(r)
@@ -215,50 +272,31 @@ def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) ->
         write_cleaned_csv(r, output_dir)
 
         monthly = summarise_by_month(r)
-        time_df = summarise_by_time_bucket(r)
         inv_row = summarise_inverters(r)
 
         # ── Monthly efficiency ────────────────────────────────────────────────
-        print(f"\n{'='*92}")
+        print(f"\n{'='*74}")
         print(f"  {summary['site_name']}")
-        print(f"{'='*92}")
-        print(f"  {'Month':<12}  {'Avg Efficiency':>16}  {'Avg Loss Delta':>16}  {'Loss % of Output':>18}  {'Total Energy Lost':>20}")
-        print(f"  {'-'*12}  {'-'*16}  {'-'*16}  {'-'*18}  {'-'*20}")
+        print(f"{'='*74}")
+        print(f"  {'Month':<12}  {'Avg Efficiency':>16}  {'Loss % of Output':>18}  {'Total Energy Lost':>20}")
+        print(f"  {'-'*12}  {'-'*16}  {'-'*18}  {'-'*20}")
         for _, row in monthly.iterrows():
             eff      = row["Average Efficiency (%)"]
-            loss     = row["Average Power Loss (kW)"]
             loss_pct = row["Loss % of Output"]
             energy   = row["Total Energy Lost (kWh)"]
-            eff_str      = f"{eff:>15.2f}%"          if pd.notna(eff)      else f"{'N/A':>15} "
-            loss_str     = f"{loss:>14.3f} kW"        if pd.notna(loss)     else f"{'N/A':>13}   "
-            loss_pct_str = f"{loss_pct:>15.2f}%"      if pd.notna(loss_pct) else f"{'N/A':>15} "
-            energy_str   = f"{energy:>16.1f} kWh"     if pd.notna(energy)   else f"{'N/A':>16}    "
-            print(f"  {row['Month']:<12}  {eff_str}  {loss_str}  {loss_pct_str}  {energy_str}")
-        print(f"{'='*92}")
+            eff_str      = f"{eff:>15.2f}%"      if pd.notna(eff)      else f"{'N/A':>15} "
+            loss_pct_str = f"{loss_pct:>15.2f}%"  if pd.notna(loss_pct) else f"{'N/A':>15} "
+            energy_str   = f"{energy:>16.1f} kWh" if pd.notna(energy)   else f"{'N/A':>16}    "
+            print(f"  {row['Month']:<12}  {eff_str}  {loss_pct_str}  {energy_str}")
+        print(f"{'='*74}")
         avg_eff      = summary["avg_efficiency_pct"]
-        avg_loss     = summary["avg_loss_delta_kw"]
         avg_loss_pct = summary["avg_loss_pct"]
         total_energy = summary["total_energy_lost_kwh"]
         eff_str      = f"{avg_eff:>15.2f}%"         if pd.notna(avg_eff)      else f"{'N/A':>15} "
-        loss_str     = f"{avg_loss:>14.3f} kW"      if pd.notna(avg_loss)     else f"{'N/A':>13}   "
         loss_pct_str = f"{avg_loss_pct:>15.2f}%"    if pd.notna(avg_loss_pct) else f"{'N/A':>15} "
         energy_str   = f"{total_energy:>16.1f} kWh" if pd.notna(total_energy) else f"{'N/A':>16}    "
-        print(f"  {'OVERALL':<12}  {eff_str}  {loss_str}  {loss_pct_str}  {energy_str}")
-        print(f"{'='*92}\n")
-
-        # ── Time of day ───────────────────────────────────────────────────────
-        print(f"  Time of Day")
-        print(f"  {'-'*64}")
-        print(f"  {'Period':<22}  {'Readings':>10}  {'Avg Efficiency':>16}  {'Avg Loss (kW)':>13}")
-        print(f"  {'-'*22}  {'-'*10}  {'-'*16}  {'-'*13}")
-        for _, row in time_df.iterrows():
-            print(
-                f"  {row['Time Period']:<22}  "
-                f"{row['Valid Readings']:>10,}  "
-                f"{row['Average Efficiency (%)']:>15.2f}%  "
-                f"{row['Average Power Loss (kW)']:>12.3f} kW"
-            )
-        print()
+        print(f"  {'OVERALL':<12}  {eff_str}  {loss_pct_str}  {energy_str}")
+        print(f"{'='*74}\n")
 
         # ── Inverter power split ──────────────────────────────────────────────
         inv_keys = [k for k in inv_row if k.startswith("Inverter")]
@@ -271,4 +309,7 @@ def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) ->
                 print(f"  ** {inv_row['Notes']}")
             print()
 
+        all_sens[r.site_id] = _phase_sensitivity(r)
+
     _print_summary_table(all_summaries)
+    _print_sensitivity_table(all_sens)
