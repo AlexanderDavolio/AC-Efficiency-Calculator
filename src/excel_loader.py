@@ -131,30 +131,43 @@ def _is_non_inverter_col(col: str) -> bool:
     return any(excl in lc for excl in _NON_INVERTER_SUBSTRINGS)
 
 
+# A column is "inverter-named" if it contains "inverter" OR the standalone token
+# "inv" (e.g. "Chint CPS-SCA60KTL INV - 1"). The \binv\b word boundary deliberately
+# does NOT match "inverters" (the aggregate) — that stays excluded via _NON_INVERTER_SUBSTRINGS.
+_INV_NAME_RE = re.compile(r"inverter|\binv\b", re.IGNORECASE)
+
+
 def _auto_detect_inverter_cols(df: pd.DataFrame, exclude: str) -> list:
     """Return columns that look like per-interval inverter kWh readings.
 
-    Primary path: columns whose name contains 'inverter' (matches every known
-    naming convention: "INVERTER 1", "Sungrow 60KW Inverter - A1", etc.) after
-    removing the meter column and known non-inverter substrings via substring match.
+    Primary path: columns whose name contains 'inverter' OR the standalone token
+    'inv' (matches every known naming convention: "INVERTER 1", "Sungrow 60KW
+    Inverter - A1", "Chint CPS-SCA60KTL INV - 1", etc.) after removing the meter
+    columns and known non-inverter substrings.
 
-    Fallback: if no 'inverter'-named columns survive, broaden to all remaining
-    numeric columns and log a warning — handles sites with atypical naming.
+    Fallback: if no inverter-named columns survive, broaden to all remaining numeric
+    columns and log a warning — handles sites with atypical naming.
+
+    The candidate pool always excludes the raw meter column, the derived "Meter kW"
+    column, and the "Inverters" aggregate (via _NON_INVERTER_SUBSTRINGS), so no
+    aggregate or meter column is ever summed as an individual channel under any path.
 
     Remaining candidates are numbered 1, 2, 3… in column order.
     """
     pre_filter = [
         c for c in df.columns
-        if c != exclude and not _is_non_inverter_col(c)
+        if c != exclude
+        and c != config.COL_METER_PRODUCTION_KW  # derived meter kW added before detection — never an inverter
+        and not _is_non_inverter_col(c)
     ]
 
-    # Prefer columns explicitly named "inverter" — catches all known conventions.
-    inv_named = [c for c in pre_filter if "inverter" in c.lower()]
+    # Prefer explicitly inverter-named columns ("inverter" or standalone "inv").
+    inv_named = [c for c in pre_filter if _INV_NAME_RE.search(c)]
     candidates = inv_named if inv_named else pre_filter
 
     if not inv_named and pre_filter:
         print(
-            f"[excel_loader] WARNING: no columns containing 'inverter' found — "
+            f"[excel_loader] WARNING: no inverter-named columns found — "
             f"falling back to broad numeric scan ({len(pre_filter)} candidate(s))"
         )
 
