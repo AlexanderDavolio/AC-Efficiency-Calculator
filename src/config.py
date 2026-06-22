@@ -111,11 +111,27 @@ MAX_INVERTER_SHARE_DEVIATION = 0.25
 # window. Single-station sites are unaffected. 0.25 = flag a >25% relative swing.
 MAX_METER_SHARE_DEVIATION = 0.25
 
-# Minimum total output (kW) for a share-deviation check to apply — used by BOTH
-# filter_inverter_comms (inverter generation) and filter_meter_comms (meter output). At
-# dawn/dusk the total is tiny and per-channel shares swing wildly from ramp-timing
-# differences alone, so the share checks are skipped below this floor.
+# Minimum total output (kW) for a share-deviation check to apply — used by
+# filter_inverter_comms (inverter generation), filter_meter_comms (meter output), AND
+# filter_phase_current (per-phase current). At dawn/dusk the total is tiny and per-channel
+# values swing wildly from ramp-timing differences alone, so these checks are skipped below
+# this floor.
 MIN_GEN_KW_FOR_SHARE_CHECK = 1.0
+
+# Single-phase CT fault detection for meter stations that expose per-phase AC current
+# (IacA/IacB/IacC). cleaners.filter_phase_current compares a station's three phase currents
+# against each other at EVERY interval: a healthy three-phase service carries near-equal
+# current on all three legs, so the per-row median of the three is a robust reference. A row
+# is dropped if any phase deviates from that median by more than this fraction — the
+# signature of one leg's CT dropping out or saturating while the others hold. This catches
+# faults the energy-share check (MAX_METER_SHARE_DEVIATION) misses: a single phase is only
+# ~1/3 of a station, so a phase dropout moves the station's TOTAL energy too little to trip
+# the share check, yet shows up plainly leg-to-leg. 0.30 = flag a phase >30% off the median
+# of the three; well above normal three-phase imbalance (typically <5%), so only gross
+# single-phase faults trip it. Below MIN_GEN_KW_FOR_SHARE_CHECK the currents are too small
+# and noisy to judge and the row is left alone. Stations missing any of the three phase
+# columns (and sites with no per-phase current data) are skipped entirely.
+MAX_PHASE_CURRENT_DEVIATION = 0.30
 
 # Allowed deviation from equal inverter power share before flagging as imbalanced.
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.

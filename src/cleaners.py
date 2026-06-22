@@ -72,6 +72,32 @@ def _meter_station_cols(df: pd.DataFrame, site_id: str = "") -> list:
     return out
 
 
+def _phase_current_groups(df: pd.DataFrame) -> list:
+    """Return per-meter-station phase-current column triples: [(stem, [IacA, IacB, IacC]), ...].
+
+    A "station" is the common column-name stem shared by a set of per-phase AC current
+    channels — e.g. "Generation Meter (PS1), IacA/IacB/IacC" all reduce to the stem
+    "Generation Meter (PS1)". Columns are matched on config.ACE_METER_CURRENT_PATTERNS
+    (["IacA", "IacB", "IacC"], ordered A/B/C); the stem is the column name with the phase
+    token removed. Only stations exposing ALL THREE phases are returned, in A/B/C order; a
+    station missing any phase column is skipped so filter_phase_current leaves it untouched.
+    Works generically for any site that exports per-phase current — single- or multi-station.
+    """
+    pats = config.ACE_METER_CURRENT_PATTERNS  # ["IacA", "IacB", "IacC"] — A, B, C in order
+    groups: dict = {}
+    for c in df.columns:
+        for idx, pat in enumerate(pats):
+            if pat.lower() in c.lower():
+                stem = re.sub(re.escape(pat), "", c, flags=re.IGNORECASE).strip().strip(",").strip()
+                groups.setdefault(stem, {})[idx] = c
+                break  # a column carries exactly one phase token
+    return [
+        (stem, [phases[i] for i in range(len(pats))])
+        for stem, phases in groups.items()
+        if len(phases) == len(pats)  # keep only stations with all three phases present
+    ]
+
+
 def filter_value_spikes(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     """Drop only the exact rows containing a physically-impossible channel value.
 
@@ -118,24 +144,36 @@ def filter_inverter_active(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
 
 
 def filter_inverter_comms(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
-    """Drop intervals where one inverter's share of generation collapses relative to its
-    baseline — a CT / communication dropout rather than a real production change.
+    """Drop intervals where one inverter reads negative during production (a hard fault) or
+    where its share of generation collapses relative to its baseline — both comms / CT
+    dropouts rather than a real production change.
 
-    Premise: with every inverter online (filter_inverter_active has already run), the
-    inverters split total generation in roughly stable proportions. A real production
-    change (clouds, curtailment, irradiance) scales them together, so their *shares* stay
-    about constant. If instead ONE inverter's reported output sags while the others carry
-    on, its share drops well below normal — the signature of a comms/CT dropout — and the
-    inverter total understates true generation, so the meter comparison for that interval
-    is unreliable and the row is dropped.
+    Two stages, in this order:
 
-    Each inverter's baseline share is the median of its per-interval share across the
-    dataset (median is robust to the very dropouts being detected). A row whose total
-    generation is at or above config.MIN_GEN_KW_FOR_SHARE_CHECK is dropped if any
-    inverter's actual share deviates from its baseline by more than
-    config.MAX_INVERTER_SHARE_DEVIATION (a fraction of that baseline). Rows below the
-    generation floor are left alone (dawn/dusk shares are too noisy to judge), as are
-    sites with fewer than two inverters (share is always 100%).
+    1. Hard physical-fault check FIRST. While the site is producing (total inverter output
+       at or above config.MIN_GEN_KW_FOR_SHARE_CHECK), no individual inverter string can
+       read negative — a negative channel during production is physically impossible and is
+       a comms/sensor fault, not a statistical deviation. Such rows are dropped outright AND
+       excluded from the baseline below. This ordering matters: if a large fraction of
+       intervals carry a negative channel, they would corrupt the median share and blind the
+       deviation check, so the absolute impossibilities must be removed before any statistics
+       are computed.
+
+    2. Share-deviation check on what remains. With every inverter online the inverters split
+       total generation in roughly stable proportions. A real production change (clouds,
+       curtailment, irradiance) scales them together, so their *shares* stay about constant.
+       If instead ONE inverter's reported output sags while the others carry on, its share
+       drops well below normal — the signature of a comms/CT dropout — and the inverter total
+       understates true generation, so the meter comparison for that interval is unreliable
+       and the row is dropped. Each inverter's baseline share is the median of its per-interval
+       share over the clean (non-faulted, non-dawn/dusk) rows. A producing row is dropped if
+       any inverter's share deviates from its baseline by more than
+       config.MAX_INVERTER_SHARE_DEVIATION (a fraction of that baseline).
+
+    Rows below the generation floor are left alone (dawn/dusk shares are too noisy to judge),
+    as are sites with fewer than two inverters (share is always 100%). No new config knob —
+    the existing MIN_GEN_KW_FOR_SHARE_CHECK floor doubles as the "site is producing" gate for
+    the negative-channel check.
     """
     before = len(df)
     site_tag = f" [{site_id}]" if site_id else ""
@@ -148,38 +186,59 @@ def filter_inverter_comms(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     inv = df[inv_cols]
     total = inv.sum(axis=1)
     eligible = total >= config.MIN_GEN_KW_FOR_SHARE_CHECK
+
+    # Stage 1 — hard fault: any individual inverter negative while the site is producing.
+    hard_fault = eligible & (inv < 0).any(axis=1)
+
+    # Stage 2 — share deviation, with the baseline learned from clean rows only (eligible and
+    # NOT hard-faulted) so a glut of negative intervals can't drag the median off true.
     shares = inv.div(total.where(total > 0), axis=0)
-
-    # Baseline = each inverter's typical share, learned from eligible (non-dawn/dusk) rows.
-    baseline = shares[eligible].median()
+    baseline_rows = eligible & ~hard_fault
+    baseline = shares[baseline_rows].median()
     rel_dev = shares.sub(baseline, axis=1).abs().div(baseline.where(baseline > 0), axis=1)
-    flagged = eligible & (rel_dev > config.MAX_INVERTER_SHARE_DEVIATION).any(axis=1)
+    deviation_flagged = baseline_rows & (rel_dev > config.MAX_INVERTER_SHARE_DEVIATION).any(axis=1)
 
+    flagged = hard_fault | deviation_flagged
     result = df[~flagged].copy()
     dropped = before - len(result)
-    print(f"  filter_inverter_comms        {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}")
+    n_hard = int(hard_fault.sum())
+    extra = f" ({n_hard:,} hard-negative)" if n_hard else ""
+    print(f"  filter_inverter_comms        {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}{extra}")
     return result
 
 
 def filter_meter_comms(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
-    """Drop intervals where one generation-meter station's share of total meter output
-    collapses relative to its baseline — a faulted/dropped station making the aggregate
-    meter reading untrustworthy.
+    """Drop intervals where one generation-meter station reads negative during production
+    (a hard fault) or where its share of total meter output collapses relative to its
+    baseline — both make the aggregate meter reading untrustworthy.
 
     Per-station analogue of filter_inverter_comms, for sites whose production meter is split
-    across multiple stations (e.g. PS1/PS2/PS3). Each station should hold a roughly stable
-    share of total meter output: a real production change scales all stations together
-    (shares ~constant), but a single station faulting or dropping out drives its share well
-    off baseline while the others carry on. Each station's baseline share is the median of
-    its per-interval share across the dataset (robust to the dropouts being detected). A row
-    whose total meter output is at or above config.MIN_GEN_KW_FOR_SHARE_CHECK is dropped if
-    any station's share deviates from its baseline by more than config.MAX_METER_SHARE_DEVIATION.
+    across multiple stations (e.g. PS1/PS2/PS3). Two stages, in this order:
+
+    1. Hard physical-fault check FIRST. While the site is producing (aggregate meter at or
+       above config.MIN_GEN_KW_FOR_SHARE_CHECK), no individual station can read negative — a
+       negative station is a faulted CT / dropped meter, physically impossible during
+       production, and must be treated as a hard fault rather than a statistical deviation.
+       These rows are dropped outright AND excluded from the baseline below. The ordering is
+       essential: this is exactly the April 2026 French's Landfill case, where 44% of station
+       readings went negative; computing the median share over those rows dragged the baseline
+       so far off true that the deviation check stopped catching the bad intervals. Removing
+       the absolute impossibilities first restores a clean baseline.
+
+    2. Share-deviation check on what remains. Each station should hold a roughly stable share
+       of total meter output: a real production change scales all stations together (shares
+       ~constant), but a single station faulting or dropping out drives its share well off
+       baseline while the others carry on. Each station's baseline share is the median of its
+       per-interval share over the clean (non-faulted, non-dawn/dusk) rows. A producing row is
+       dropped if any station's share deviates from its baseline by more than
+       config.MAX_METER_SHARE_DEVIATION.
 
     Fully automatic and surgical: detection is purely per-interval, with no hardcoded dates
-    or site-specific windows. If one station faults for two weeks while the others are fine,
-    only those specific intervals are dropped; every interval where all stations agree with
-    their baseline is preserved. Sites with fewer than two meter stations pass through
-    untouched.
+    or site-specific windows, and no new config knob (the existing MIN_GEN_KW_FOR_SHARE_CHECK
+    floor doubles as the "site is producing" gate for the negative-channel check). If one
+    station faults for two weeks while the others are fine, only those specific intervals are
+    dropped; every interval where all stations agree with their baseline is preserved. Sites
+    with fewer than two meter stations pass through untouched.
     """
     before = len(df)
     site_tag = f" [{site_id}]" if site_id else ""
@@ -197,14 +256,87 @@ def filter_meter_comms(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     total_kw = pd.to_numeric(df[config.COL_METER_PRODUCTION_KW], errors="coerce")
     eligible = total_kw >= config.MIN_GEN_KW_FOR_SHARE_CHECK
 
-    # Baseline = each station's typical share, learned from eligible (non-dawn/dusk) rows.
-    baseline = shares[eligible].median()
+    # Stage 1 — hard fault: any individual station negative while the site is producing.
+    hard_fault = eligible & (stations < 0).any(axis=1)
+
+    # Stage 2 — share deviation, with the baseline learned from clean rows only (eligible and
+    # NOT hard-faulted) so the negative-station glut can't corrupt the median (the April 2026
+    # failure mode above).
+    baseline_rows = eligible & ~hard_fault
+    baseline = shares[baseline_rows].median()
     rel_dev = shares.sub(baseline, axis=1).abs().div(baseline.where(baseline > 0), axis=1)
-    flagged = eligible & (rel_dev > config.MAX_METER_SHARE_DEVIATION).any(axis=1)
+    deviation_flagged = baseline_rows & (rel_dev > config.MAX_METER_SHARE_DEVIATION).any(axis=1)
+
+    flagged = hard_fault | deviation_flagged
+    result = df[~flagged].copy()
+    dropped = before - len(result)
+    n_hard = int(hard_fault.sum())
+    extra = f" ({n_hard:,} hard-negative)" if n_hard else ""
+    print(f"  filter_meter_comms           {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}{extra}")
+    return result
+
+
+def filter_phase_current(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
+    """Drop intervals where one phase current of a meter station is out of line with the
+    other two — a single-phase CT fault while the rest of the station reads normally.
+
+    Per-PHASE analogue of filter_meter_comms, one level finer. Where filter_meter_comms
+    compares each station's share of total meter ENERGY against a learned baseline, this
+    compares the three per-phase AC currents (IacA/IacB/IacC) WITHIN each station against each
+    other, at every interval. A healthy three-phase service carries near-equal current on all
+    three legs, so the per-row median of the three is a robust reference; if one leg's CT
+    drops out or saturates while the others hold, that phase swings far off the median. This
+    catches faults the energy-share check misses: a single phase is only ~1/3 of a station, so
+    a phase dropout moves the station's total energy too little to trip MAX_METER_SHARE_DEVIATION,
+    yet shows up plainly leg-to-leg. (This is exactly the French's Landfill Apr 13-18 case —
+    PS1 IacB flatlined near 257 A while IacA/IacC held around 1,550 A.)
+
+    Two stages, mirroring filter_meter_comms, evaluated per station and unioned across stations:
+
+    1. Hard physical-fault check FIRST: while the site is producing (aggregate meter at or
+       above config.MIN_GEN_KW_FOR_SHARE_CHECK) no phase current can read negative — a negative
+       leg is a faulted/dropped CT, not real current — so those rows are dropped outright.
+    2. Median-deviation check on the remaining producing rows: per interval, take the median of
+       a station's three phase currents and drop the row if any phase deviates from that median
+       by more than config.MAX_PHASE_CURRENT_DEVIATION (a fraction of the median).
+
+    The reference median is computed per ROW from the three phases (not a cross-row baseline),
+    so it needs no warm-up and can't be corrupted by a run of bad intervals. Rows below the
+    producing floor are left alone (phase currents are tiny and noisy at dawn/dusk). Stations
+    missing any of the three phase columns are skipped; a site with no per-phase current data
+    passes through untouched. Fully automatic and per-interval — no dates, no per-site config.
+    """
+    before = len(df)
+    site_tag = f" [{site_id}]" if site_id else ""
+    groups = _phase_current_groups(df)
+
+    if not groups or before == 0:
+        print(f"  filter_phase_current         {site_tag}: dropped {0:>6,} rows | remaining {len(df):,}")
+        return df.copy()
+
+    total_kw = pd.to_numeric(df[config.COL_METER_PRODUCTION_KW], errors="coerce")
+    eligible = total_kw >= config.MIN_GEN_KW_FOR_SHARE_CHECK
+
+    # Accumulate faults across every station's phase triple (a row is bad if ANY station is bad).
+    hard_raw = pd.Series(False, index=df.index)   # any phase reads negative
+    dev_raw = pd.Series(False, index=df.index)    # any phase off its station's per-row median
+    for _stem, cols in groups:
+        phases = df[cols].apply(pd.to_numeric, errors="coerce")
+        hard_raw |= (phases < 0).any(axis=1)
+        med = phases.median(axis=1)
+        rel_dev = phases.sub(med, axis=0).abs().div(med.where(med > 0), axis=0)
+        dev_raw |= (rel_dev > config.MAX_PHASE_CURRENT_DEVIATION).any(axis=1)
+
+    # Stage 1 hard faults, then stage 2 deviation on the producing rows that aren't already hard.
+    hard_fault = eligible & hard_raw
+    deviation_flagged = eligible & ~hard_fault & dev_raw
+    flagged = hard_fault | deviation_flagged
 
     result = df[~flagged].copy()
     dropped = before - len(result)
-    print(f"  filter_meter_comms           {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}")
+    n_hard = int(hard_fault.sum())
+    extra = f" ({n_hard:,} hard-negative)" if n_hard else ""
+    print(f"  filter_phase_current         {site_tag}: dropped {dropped:>6,} rows | remaining {len(result):,}{extra}")
     return result
 
 
@@ -241,6 +373,7 @@ def run_all_filters(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     df = filter_inverter_active(df, site_id)
     df = filter_inverter_comms(df, site_id)
     df = filter_meter_comms(df, site_id)
+    df = filter_phase_current(df, site_id)
     df = filter_gross_outliers(df, site_id)
 
     rows_out = len(df)
