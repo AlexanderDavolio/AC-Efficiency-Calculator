@@ -34,6 +34,7 @@ from typing import List, Union
 
 from src.models import SiteRecord
 from src import config
+from src.cumulative import to_interval_if_cumulative
 
 
 # ── Strict OOXML compatibility ────────────────────────────────────────────────
@@ -93,6 +94,34 @@ def _find_meter_col(cols, patterns: list) -> str:
             if pat_lc in lc:
                 return original
     return None
+
+
+# Per-phase voltage / current / power-factor sub-columns share the meter's base name
+# (e.g. "Generation Meter (PS1), IacA"), so a substring meter match would wrongly catch
+# them. These tokens identify and exclude such auxiliary channels.
+_METER_AUX_PATTERNS = (
+    config.ACE_METER_VOLTAGE_PATTERNS
+    + config.ACE_METER_CURRENT_PATTERNS
+    + ["Power factor"]
+)
+
+
+def _find_meter_cols(cols, patterns: list) -> list:
+    """Return ALL energy columns matching any meter pattern, in column order.
+
+    Unlike _find_meter_col (first match only), this is used for configured sites whose
+    production meter is split across several columns that must be summed — e.g. one
+    generation meter per power station. Per-phase V/I and power-factor sub-columns are
+    excluded so only the base meter-energy columns are returned.
+    """
+    out = []
+    for c in cols:
+        lc = c.lower()
+        if any(aux.lower() in lc for aux in _METER_AUX_PATTERNS):
+            continue
+        if any(pat.lower() in lc for pat in patterns):
+            out.append(c)
+    return out
 
 
 def _auto_detect_meter_col(cols: list) -> str:
@@ -245,32 +274,50 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
     kw_factor = 60.0 / config.INTERVAL_MINUTES  # kWh → kW for INTERVAL_MINUTES-min readings
 
     # ── Meter column detection ────────────────────────────────────────────────
-    if site_cfg is None:
-        meter_col = _auto_detect_meter_col(list(df.columns))
-        if meter_col:
-            print(f"[excel_loader] auto-detect '{site_id}': using '{meter_col}' as meter column")
-        else:
+    # meter_cols may hold more than one column for multi-meter sites (e.g. one
+    # generation meter per power station); they are summed into the site meter.
+    # Auto-detect unless the site config explicitly supplies meter patterns — so a config
+    # that carries only reporting metadata (e.g. excluded_months) doesn't change ingestion.
+    if site_cfg is None or site_cfg.meter_patterns is None:
+        single = _auto_detect_meter_col(list(df.columns))
+        if not single:
             raise ValueError(
                 f"[excel_loader] ACE site '{site_id}': could not auto-detect meter column"
             )
+        meter_cols = [single]
+        print(f"[excel_loader] auto-detect '{site_id}': using '{single}' as meter column")
     else:
-        meter_patterns = (
-            site_cfg.meter_patterns if site_cfg.meter_patterns is not None
-            else config.ACE_METER_COLUMN_PATTERNS
-        )
-        meter_col = _find_meter_col(df.columns, meter_patterns)
-        if meter_col is None:
+        meter_patterns = site_cfg.meter_patterns
+        meter_cols = _find_meter_cols(df.columns, meter_patterns)
+        if not meter_cols:
             raise ValueError(
                 f"[excel_loader] ACE site '{site_id}': no meter column matched {meter_patterns}"
             )
+        if len(meter_cols) > 1:
+            print(f"[excel_loader] site '{site_id}': meter = sum of {len(meter_cols)} columns {meter_cols}")
+        else:
+            print(f"[excel_loader] site '{site_id}': using '{meter_cols[0]}' as meter column")
 
+    # Convert any cumulative register per source column, then sum, then kWh -> kW.
     df[config.COL_METER_PRODUCTION_KW] = (
-        pd.to_numeric(df[meter_col], errors="coerce") * kw_factor
+        pd.concat(
+            [
+                to_interval_if_cumulative(
+                    pd.to_numeric(df[c], errors="coerce"),
+                    df[config.COL_TIMESTAMP], c, site_id,
+                )
+                for c in meter_cols
+            ],
+            axis=1,
+        ).sum(axis=1, skipna=True)
+        * kw_factor
     )
 
     # ── Inverter column detection ─────────────────────────────────────────────
-    if site_cfg is None:
-        inv_kwh_matches = _auto_detect_inverter_cols(df, meter_col)
+    # Auto-detect unless the site config explicitly supplies inverter patterns (same
+    # rationale as the meter block above).
+    if site_cfg is None or site_cfg.inverter_patterns is None:
+        inv_kwh_matches = _auto_detect_inverter_cols(df, meter_cols[0])
         if inv_kwh_matches:
             print(
                 f"[excel_loader] auto-detect '{site_id}': found {len(inv_kwh_matches)} "
@@ -281,10 +328,7 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
                 f"[excel_loader] ACE site '{site_id}': could not auto-detect inverter columns"
             )
     else:
-        inv_patterns = (
-            site_cfg.inverter_patterns if site_cfg.inverter_patterns is not None
-            else config.ACE_INVERTER_COLUMN_PATTERNS
-        )
+        inv_patterns = site_cfg.inverter_patterns
         seen_nums: dict = {}
         for c in df.columns:
             c_lc = c.lower()
@@ -305,9 +349,16 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
     n_inv = len(inv_kwh_matches)
     for inv_num, kwh_cols in inv_kwh_matches:
         # Sum all source columns for this inverter number (handles multi-string inverters),
-        # then convert from per-interval kWh to average kW.
-        kw = sum(pd.to_numeric(df[c], errors="coerce") for c in kwh_cols)
-        df[f"Inverter {inv_num} AC kW"] = (kw * kw_factor).fillna(0.0)
+        # converting any cumulative register to per-interval energy first (per source
+        # column, so one string's rollover does not zero the whole inverter), then kWh -> kW.
+        kwh = sum(
+            to_interval_if_cumulative(
+                pd.to_numeric(df[c], errors="coerce"),
+                df[config.COL_TIMESTAMP], c, site_id,
+            )
+            for c in kwh_cols
+        )
+        df[f"Inverter {inv_num} AC kW"] = (kwh * kw_factor).fillna(0.0)
 
     # Coerce meter phase voltage and current columns to numeric; pass through as raw
     for pat in config.ACE_METER_VOLTAGE_PATTERNS + config.ACE_METER_CURRENT_PATTERNS:
@@ -315,7 +366,7 @@ def _add_ace_derived_columns(df: pd.DataFrame, site_id: str) -> pd.DataFrame:
         if col is not None:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    print(f"[excel_loader] ACE site '{site_id}': {n_inv} inverters, meter='{meter_col}'")
+    print(f"[excel_loader] ACE site '{site_id}': {n_inv} inverters, meter='{', '.join(meter_cols)}'")
 
     return df
 

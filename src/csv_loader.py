@@ -20,6 +20,7 @@ from typing import List
 
 from src.models import SiteRecord
 from src import config
+from src.cumulative import to_interval_if_cumulative
 
 
 RAW_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
@@ -37,6 +38,33 @@ def _find_col(cols, patterns: list) -> str:
             if pat_lc in lc:
                 return original
     return None
+
+
+# Per-phase voltage / current / power-factor sub-columns share the meter's base name
+# (e.g. "Generation Meter (PS1), IacA"), so a substring meter match would wrongly catch
+# them. These tokens identify and exclude such auxiliary channels.
+_METER_AUX_PATTERNS = (
+    config.ACE_METER_VOLTAGE_PATTERNS
+    + config.ACE_METER_CURRENT_PATTERNS
+    + ["Power factor"]
+)
+
+
+def _find_meter_cols(cols, patterns: list) -> list:
+    """Return ALL energy columns matching any meter pattern, in column order.
+
+    Used for sites whose production meter is split across several columns that must be
+    summed (e.g. one generation meter per power station). Per-phase V/I and power-factor
+    sub-columns are excluded so only base meter-energy columns are returned.
+    """
+    out = []
+    for c in cols:
+        lc = c.lower()
+        if any(aux.lower() in lc for aux in _METER_AUX_PATTERNS):
+            continue
+        if any(pat.lower() in lc for pat in patterns):
+            out.append(c)
+    return out
 
 
 def discover_sites(raw_dir: Path = RAW_DATA_DIR) -> List[Path]:
@@ -82,14 +110,27 @@ def load_site(csv_path: Path) -> SiteRecord:
     # Timestamps — CSV strings are directly parseable
     df[config.COL_TIMESTAMP] = pd.to_datetime(df[config.COL_TIMESTAMP], errors="coerce")
 
-    # Meter kW
-    meter_col = _find_col(df.columns, meter_patterns)
-    if meter_col is None:
+    # Meter kW — sum all matching meter columns (multi-meter sites), converting any
+    # cumulative register to per-interval energy per source column first.
+    meter_cols = _find_meter_cols(df.columns, meter_patterns)
+    if not meter_cols:
         raise ValueError(
             f"[csv_loader] site '{site_id}': no meter column matched {meter_patterns}"
         )
+    if len(meter_cols) > 1:
+        print(f"[csv_loader] site '{site_id}': meter = sum of {len(meter_cols)} columns {meter_cols}")
     df[config.COL_METER_PRODUCTION_KW] = (
-        pd.to_numeric(df[meter_col], errors="coerce") * kw_factor
+        pd.concat(
+            [
+                to_interval_if_cumulative(
+                    pd.to_numeric(df[c], errors="coerce"),
+                    df[config.COL_TIMESTAMP], c, site_id,
+                )
+                for c in meter_cols
+            ],
+            axis=1,
+        ).sum(axis=1, skipna=True)
+        * kw_factor
     )
 
     # Per-inverter kW — discover columns via config patterns, extract number from name.
@@ -116,8 +157,15 @@ def load_site(csv_path: Path) -> SiteRecord:
     for inv_num, kwh_cols in inv_kwh_matches:
         for c in kwh_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+        # Convert any cumulative register to per-interval energy per source column
+        # (so one string's rollover does not zero the whole inverter), then sum and
+        # convert kWh -> kW.
+        interval = [
+            to_interval_if_cumulative(df[c], df[config.COL_TIMESTAMP], c, site_id)
+            for c in kwh_cols
+        ]
         df[f"Inverter {inv_num} AC kW"] = (
-            df[kwh_cols].sum(axis=1, skipna=True) * kw_factor
+            pd.concat(interval, axis=1).sum(axis=1, skipna=True) * kw_factor
         )
 
     # Coerce V/I columns to numeric; pass through as raw
@@ -127,7 +175,7 @@ def load_site(csv_path: Path) -> SiteRecord:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     n_inv = len(inv_kwh_matches)
-    print(f"[csv_loader] ACE site '{site_id}': {n_inv} inverters, meter='{meter_col}'")
+    print(f"[csv_loader] ACE site '{site_id}': {n_inv} inverters, meter='{', '.join(meter_cols)}'")
 
     # Sort by timestamp
     df = df.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)

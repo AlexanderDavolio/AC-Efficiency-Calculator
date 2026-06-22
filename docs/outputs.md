@@ -8,7 +8,7 @@ A completed run produces two types of output in the `output/` directory: a clean
 
 **File:** `output/<site_id>_cleaned.csv`
 
-This is the row-level dataset after cleaning and enrichment. It contains every row that survived all four filters, with three groups of columns:
+This is the row-level dataset after cleaning and enrichment. It contains every row that survived all cleaning filters, with three groups of columns:
 
 **Original columns** — all columns from the raw CSV, exactly as loaded (column names whitespace-stripped). Extra columns from your DAS export are preserved here.
 
@@ -57,6 +57,31 @@ One row per site per calendar month. Use this tab to identify:
 - **Anomalous months** — a single month with materially lower efficiency than adjacent months may correspond to a known event (equipment swap, extended curtailment, grid issue) or an unknown one worth investigating
 
 Columns mirror the summary tab but are scoped to each month: row count, efficiency avg/min/max, and average loss delta.
+
+---
+
+### Data Gaps and Site Notes
+
+Below each site's monthly table, the console report surfaces two things that the table itself cannot show:
+
+**Data Gaps** — months that had recorded data (meter readings and/or inverter generation) in the raw export but **too few clean intervals to report** an efficiency. A month appears in the monthly table only if it has at least `config.MIN_CLEAN_INTERVALS_PER_MONTH` clean intervals (default 100, ≈ 25 hours at 15-min resolution); every other month with recorded data is listed here instead of being silently absent or shown as a meaningless number. Each gap month is listed with its clean/meter/generation row counts and a reason:
+
+| Reason | Meaning |
+|---|---|
+| `CT issue - meter readings unreliable` | Month listed in the site's `SITE_CONFIGS` `excluded_months` — a confirmed data-quality fault (e.g. a CT problem corrupting the meter) means the month is excluded from reporting **regardless of how many clean intervals it has**. Takes precedence over the reasons below. |
+| `efficiency anomaly - possible meter or instrumentation fault` | The month's efficiency is statistically far below the site's own history — more than `config.ANOMALY_STD_THRESHOLD` standard deviations below the median of all reported months. Flagged automatically (no dates, no per-site config) and excluded from the monthly table and OVERALL. A month statistically out of place against the site's normal range is the signature of a meter/instrumentation fault rather than a real loss. |
+| `insufficient clean intervals` | Some clean data survived, but fewer than the monthly minimum — too few to trust a number (e.g. a few timing-jittered rows reading 131%, or a month gutted by CT/comms dropouts). |
+| `incomplete inverter data` | Both meter and inverter generation were recorded, but never with all inverter strings reporting at once — so the inverter-active filter dropped every row. Typically a telemetry/monitoring gap on one string, not lost production. |
+| `no inverter telemetry` | The meter was recording but the inverters never reported generation that month. |
+| `no meter data` | Inverters were generating but the meter was not recording. |
+
+Months with no recorded data at all (pre-commissioning, full outages) are *not* listed — they are genuinely absent rather than dropped.
+
+A config-excluded month (`CT issue …`) is removed from **every** reported efficiency figure — the monthly table, the overall site average, the time-of-day and inverter-split tables, and the sensitivity table — not just the monthly row. Its rows still appear in the raw data and the cleaned CSV; only the *reported efficiency* omits them.
+
+Note this threshold only screens out **sparse** months. A month with plenty of clean intervals that nonetheless reads low is reported as-is — that is a real measurement, whether it reflects genuine losses or a pervasive (every-interval) sensor/CT issue, and is not what this guard is for.
+
+**Notes** — curated, human-readable caveats for a specific site, defined in `config.SITE_NOTES` and printed verbatim. Use these for known data-quality issues that cannot be derived from the data alone (e.g. a specific inverter string's telemetry outage and what it means for the results).
 
 ---
 

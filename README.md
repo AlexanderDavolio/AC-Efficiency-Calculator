@@ -15,9 +15,10 @@ underperforming sites, systematic losses, and trends over time.
 |---|---|
 | `src/config.py` | Global constants and thresholds — column names, interval length, cleaning bounds, imbalance tolerances. Edit here when data schema or business rules change. |
 | `src/excel_loader.py` | Reads AlsoEnergy ACE workbooks. Auto-detects the production meter column and per-inverter kWh columns for each sheet. Converts kWh to average kW, handles strict OOXML format transparently. |
-| `src/cleaners.py` | Filters nighttime rows (any inverter at zero), comms dropouts, and gross outliers (efficiency outside 80–100%). |
+| `src/cleaners.py` | Filters physically-impossible value spikes (DAS glitches), nighttime/offline rows (any inverter at zero), inverter CT/communication dropouts (one inverter's share of generation collapsing vs its baseline), per-station meter CT/communication dropouts (one generation-meter station's share of total meter output collapsing vs its baseline, for multi-meter sites), and gross outliers (efficiency outside the sensor-sanity band). |
+| `src/cumulative.py` | Detects energy columns exported as cumulative lifetime registers and differences them back to per-interval energy (clamping counter resets/rollovers). Used by both loaders before the kWh→kW step. |
 | `src/calculator.py` | Computes `efficiency_pct` (meter kW / inverter total kW × 100), `loss_delta_kw`, `loss_pct`, `energy_lost_kwh`, and time-of-day buckets. |
-| `src/reporter.py` | Prints terminal output: per-site monthly efficiency tables, inverter power split, cross-site summary, and a phase imbalance sensitivity table. Writes a cleaned CSV per site to `output/`. |
+| `src/reporter.py` | Prints terminal output: per-site monthly efficiency tables, a **data-gaps list** (months not reported — too few clean intervals, config-excluded, or a **statistical efficiency anomaly**: any month more than `config.ANOMALY_STD_THRESHOLD` std devs below the site's own median monthly efficiency is auto-flagged and excluded from the monthly table and OVERALL), any **curated site notes** (`config.SITE_NOTES`), inverter power split, cross-site summary, and a phase imbalance sensitivity table. Writes a cleaned CSV per site to `output/`. |
 | `main.py` | Entry point. Loads the workbook, runs cleaners → calculator → reporter in order. Accepts an optional `--site` flag to process a single site. |
 
 ## Input Format
@@ -58,10 +59,14 @@ Output CSVs land in `output/<site_name>_cleaned.csv`.
 
 ## Known Data Requirements
 
-- **Inverter columns must be interval kWh, not cumulative lifetime energy.** Columns
-  that accumulate over time (daily running totals, lifetime totals) will produce
-  incorrect kW values. The pipeline does not attempt to detect or correct cumulative
-  columns — export interval energy from AlsoEnergy, not cumulative energy.
+- **Cumulative lifetime registers are auto-detected and converted.** Interval kWh is
+  still the preferred export, but if an energy column (meter or inverter) arrives as a
+  cumulative running total, the loader detects it — non-decreasing across ≥95% of
+  readings in timestamp order — and differences it back to per-interval energy before
+  the kWh→kW step. Counter resets / register rollovers (sharp negative jumps) are
+  clamped to zero so they contribute no energy. A `[cumulative] WARNING:` line is
+  logged for every converted column. Detection requires near-monotonic data, so
+  genuinely bidirectional channels are left untouched. See `src/cumulative.py`.
 
 - **A true point-of-interconnection (POI) meter is required.** The pipeline computes
   efficiency as meter ÷ inverter total. Sites where the "meter" column is not a real
