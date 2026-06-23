@@ -4,6 +4,7 @@ import calendar
 import contextlib
 import io
 import re
+import sys
 import textwrap
 from pathlib import Path
 from typing import List
@@ -17,13 +18,25 @@ from src import config
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
+# When True, also print the Phase Imbalance Sensitivity diagnostic table (and compute it).
+# Off by default so the report stays focused for a non-technical audience.
+VERBOSE = False
 
-# ── Months kept out of reported efficiency ─────────────────────────────────────
-# Two reasons a month is excluded from every reported efficiency figure (monthly table,
-# OVERALL, time-of-day, inverter split) yet kept in the raw data and cleaned CSV:
+
+# ── Good-day methodology + months kept out of reported efficiency ──────────────
+# Reported efficiency is computed over GOOD DAYS only. A producing day (>=1 interval with
+# raw meter > NIGHTTIME_KW_THRESHOLD) is "good" when at least config.GOOD_DAY_MIN_CLEAN_PCT
+# of its production intervals survive every cleaning filter; otherwise it is a "bad" day and
+# its intervals are excluded from the monthly and overall efficiency figures. The good/bad
+# day counts are reported alongside the efficiency numbers (see summarise_by_month /
+# summarise_site). The day's data still lives in the raw input and cleaned CSV — only the
+# reported efficiency is restricted to good days.
+#
+# Two further reasons a whole month is excluded from every reported efficiency figure:
 #   1. config: a SITE_CONFIGS excluded_months entry (e.g. a confirmed CT fault)
 #   2. anomaly: the month's efficiency is statistically far below the site's own history
-# Both are surfaced in the Data Gaps section. The data frames flow through three layers:
+# Both are surfaced in the Data Gaps section. The data frames flow through two layers, each
+# already restricted to good days:
 #   _baseline_df   — config exclusions removed (the basis for anomaly detection)
 #   _reportable_df — config AND anomaly exclusions removed (basis for all reported figures)
 # Anomaly detection runs on _baseline_df (NOT _reportable_df) to avoid a circular dependency.
@@ -43,6 +56,54 @@ def _drop_periods(df: pd.DataFrame, periods: set) -> pd.DataFrame:
         return df
     per = pd.to_datetime(df[config.COL_TIMESTAMP], errors="coerce").dt.to_period("M")
     return df[~per.isin(periods)]
+
+
+def _day_quality(record: SiteRecord) -> pd.DataFrame:
+    """One row per producing calendar day, classified good/bad for the good-day methodology.
+
+    A producing day has >=1 interval whose raw meter reading exceeds
+    config.NIGHTTIME_KW_THRESHOLD. The day is "good" when the fraction of those production
+    intervals that survive every cleaning filter (i.e. appear in enriched_df) is at least
+    config.GOOD_DAY_MIN_CLEAN_PCT; otherwise it is "bad". Returns a DataFrame indexed by date
+    (normalised Timestamp) with columns: period (monthly Period), n_prod, n_clean, frac, good.
+    Days with no production at all are omitted — they are neither good nor bad, just dark.
+    """
+    raw = record.raw_df
+    clean_idx = record.enriched_df.index
+    ts = pd.to_datetime(raw[config.COL_TIMESTAMP], errors="coerce")
+    meter = pd.to_numeric(raw[config.COL_METER_PRODUCTION_KW], errors="coerce")
+    work = pd.DataFrame({
+        "date":   ts.dt.normalize(),
+        "period": ts.dt.to_period("M"),
+        "prod":   (meter > config.NIGHTTIME_KW_THRESHOLD).to_numpy(),
+        "clean":  raw.index.isin(clean_idx),
+    })
+    work = work[work["prod"] & work["date"].notna()]
+    if work.empty:
+        return pd.DataFrame(columns=["period", "n_prod", "n_clean", "frac", "good"])
+    grp = work.groupby("date")
+    out = pd.DataFrame({
+        "period":  grp["period"].first(),
+        "n_prod":  grp.size(),
+        "n_clean": grp["clean"].sum(),
+    })
+    out["frac"] = out["n_clean"] / out["n_prod"]
+    out["good"] = out["frac"] >= config.GOOD_DAY_MIN_CLEAN_PCT
+    return out
+
+
+def _good_day_dates(record: SiteRecord) -> set:
+    """Set of normalised Timestamps for the site's good days (see _day_quality)."""
+    dq = _day_quality(record)
+    return set(dq.index[dq["good"]])
+
+
+def _keep_good_days(df: pd.DataFrame, good_dates: set) -> pd.DataFrame:
+    """Return only the rows of df whose timestamp falls on one of the given good days."""
+    if df.empty:
+        return df
+    day = pd.to_datetime(df[config.COL_TIMESTAMP], errors="coerce").dt.normalize()
+    return df[day.isin(good_dates)]
 
 
 def _monthly_weighted_efficiency(df: pd.DataFrame) -> pd.Series:
@@ -83,14 +144,17 @@ def _nonreportable_periods(record: SiteRecord) -> set:
 
 
 def _baseline_df(record: SiteRecord) -> pd.DataFrame:
-    """enriched_df with config-excluded months removed — basis for anomaly detection."""
-    return _drop_periods(record.enriched_df, _excluded_periods(record.site_id))
+    """enriched_df restricted to good days with config-excluded months removed — basis for
+    anomaly detection."""
+    df = _drop_periods(record.enriched_df, _excluded_periods(record.site_id))
+    return _keep_good_days(df, _good_day_dates(record))
 
 
 def _reportable_df(record: SiteRecord) -> pd.DataFrame:
-    """enriched_df with config-excluded AND statistically-anomalous months removed — the
-    basis for ALL reported efficiency figures."""
-    return _drop_periods(record.enriched_df, _nonreportable_periods(record))
+    """enriched_df restricted to good days, with config-excluded AND statistically-anomalous
+    months removed — the basis for ALL reported efficiency figures."""
+    df = _drop_periods(record.enriched_df, _nonreportable_periods(record))
+    return _keep_good_days(df, _good_day_dates(record))
 
 
 # ── Energy-weighted roll-ups ──────────────────────────────────────────────────
@@ -138,14 +202,22 @@ def summarise_site(record: SiteRecord) -> dict:
     """Return a summary dict. Efficiency/loss figures use only reportable months (config
     exclusions removed); row counts and the date range reflect all clean data."""
     full = record.enriched_df               # all clean intervals — counts and date range
-    rep = _reportable_df(record)            # excludes untrustworthy months — efficiency
+    rep = _reportable_df(record)            # good days, untrustworthy months removed — efficiency
     ts = full[config.COL_TIMESTAMP]
+
+    # Good/bad day tally over reportable periods (matches the basis of the efficiency figure).
+    dq = _day_quality(record)
+    dq = dq[~dq["period"].isin(_nonreportable_periods(record))]
+    good_days = int(dq["good"].sum())
+    bad_days  = int(len(dq) - good_days)
 
     summary = {
         "site_name":          record.site_id,
         "total_raw_rows":     len(record.raw_df),
         "clean_rows":         len(full),
         "clean_row_pct":      round(len(full) / len(record.raw_df) * 100, 2),
+        "good_days":          good_days,
+        "bad_days":           bad_days,
         "avg_efficiency_pct": round(_weighted_efficiency_pct(rep), 3),
         "min_efficiency_pct": round(rep[config.COL_EFFICIENCY_PCT].min(), 3),
         "max_efficiency_pct": round(rep[config.COL_EFFICIENCY_PCT].max(), 3),
@@ -199,10 +271,11 @@ def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
     agg["avg_loss_pct"] = 100.0 * (agg["_sum_inverter_kw"] - agg["_sum_meter_kw"]) / inv_pos
 
     if agg.empty:
-        return pd.DataFrame(columns=["Month", "Valid Readings", "Average Efficiency (%)",
-                                     "Min Efficiency (%)", "Max Efficiency (%)",
-                                     "Average Power Loss (kW)", "Loss % of Output",
-                                     "Total Power Loss (kW)", "Total Energy Lost (kWh)"])
+        return pd.DataFrame(columns=["Month", "Good Days", "Bad Days", "Valid Readings",
+                                     "Average Efficiency (%)", "Min Efficiency (%)",
+                                     "Max Efficiency (%)", "Average Power Loss (kW)",
+                                     "Loss % of Output", "Total Power Loss (kW)",
+                                     "Total Energy Lost (kWh)"])
 
     float_cols = ["avg_efficiency_pct", "min_efficiency_pct", "max_efficiency_pct",
                   "avg_loss_delta_kw", "total_loss_delta_kw"]
@@ -214,8 +287,21 @@ def summarise_by_month(record: SiteRecord) -> pd.DataFrame:
         lambda r: f"{calendar.month_abbr[int(r['_month'])]} {int(r['_year'])}", axis=1
     )
 
+    # Good/bad day counts per reported month (same good-day basis as the efficiency above).
+    dq = _day_quality(record)
+    dq = dq[~dq["period"].isin(_nonreportable_periods(record))]
+    good_by_period = dq.groupby("period")["good"].sum()
+    prod_by_period = dq.groupby("period").size()
+    periods = agg.apply(
+        lambda r: pd.Period(year=int(r["_year"]), month=int(r["_month"]), freq="M"), axis=1
+    )
+    good_days = periods.map(lambda p: int(good_by_period.get(p, 0)))
+    bad_days  = periods.map(lambda p: int(prod_by_period.get(p, 0)) - int(good_by_period.get(p, 0)))
+
     return pd.DataFrame({
         "Month":                    month_labels,
+        "Good Days":                good_days,
+        "Bad Days":                 bad_days,
         "Valid Readings":           agg["row_count"],
         "Average Efficiency (%)":   agg["avg_efficiency_pct"],
         "Min Efficiency (%)":       agg["min_efficiency_pct"],
@@ -338,9 +424,11 @@ def summarise_gap_months(record: SiteRecord) -> list:
     else:
         meter = pd.Series(0.0, index=raw.index)
 
-    # Count clean, efficiency-defined intervals per month — the same basis as the monthly
-    # table's row count. A month is "reported" iff this reaches the minimum threshold.
-    clean = record.enriched_df
+    # Count good-day, efficiency-defined intervals per month — the same basis as the monthly
+    # table's row count (which is restricted to good days). A month is "reported" iff this
+    # reaches the minimum threshold; a month with clean data but too few GOOD-day intervals
+    # surfaces here as "insufficient clean intervals" rather than silently vanishing.
+    clean = _keep_good_days(record.enriched_df, _good_day_dates(record))
     clean = clean[clean[config.COL_EFFICIENCY_PCT].notna()]
     clean_counts = (
         pd.to_datetime(clean[config.COL_TIMESTAMP], errors="coerce")
@@ -374,6 +462,7 @@ def summarise_gap_months(record: SiteRecord) -> list:
             reason = "incomplete inverter data"      # both present, but not all inverters at once
         gaps.append({
             "month":      f"{calendar.month_abbr[p.month]} {p.year}",
+            "period":     p,
             "raw_rows":   int(len(sub)),
             "meter_rows": meter_rows,
             "gen_rows":   gen_rows,
@@ -383,6 +472,49 @@ def summarise_gap_months(record: SiteRecord) -> list:
     return gaps
 
 
+# Short, audience-friendly labels for the condensed Data Gaps lines, keyed by the verbose
+# reason recorded in summarise_gap_months. Unmapped reasons fall back to their raw text.
+_GAP_REASON_LABELS = {
+    "CT issue - meter readings unreliable":                          "CT issue - meter readings unreliable",
+    "efficiency anomaly - possible meter or instrumentation fault":  "efficiency anomaly",
+    "insufficient clean intervals":                                  "insufficient clean intervals",
+    "incomplete inverter data":                                      "incomplete inverter telemetry",
+    "no inverter telemetry":                                         "no inverter telemetry",
+    "no meter data":                                                 "no meter data",
+}
+
+
+def _condense_gap_windows(gaps: list) -> list:
+    """Collapse the per-month gap list into one line per contiguous same-reason window.
+
+    Consecutive calendar months that share a reason are merged so a long outage reads as a
+    single line, e.g. 'Sep 2024 - Jul 2025 (11 months): incomplete inverter telemetry'
+    instead of eleven interval-count rows. `gaps` is the chronological list from
+    summarise_gap_months (each item carries a 'period' Period and a 'reason'). Returns a
+    list of formatted strings in chronological order.
+    """
+    windows = []
+    for g in gaps:
+        p, reason = g["period"], g["reason"]
+        if windows and windows[-1]["reason"] == reason and windows[-1]["end"] + 1 == p:
+            windows[-1]["end"] = p
+            windows[-1]["n"] += 1
+        else:
+            windows.append({"start": p, "end": p, "reason": reason, "n": 1})
+
+    lines = []
+    for w in windows:
+        label = _GAP_REASON_LABELS.get(w["reason"], w["reason"])
+        start = f"{calendar.month_abbr[w['start'].month]} {w['start'].year}"
+        if w["n"] == 1:
+            span = f"{start} (1 month)"
+        else:
+            end = f"{calendar.month_abbr[w['end'].month]} {w['end'].year}"
+            span = f"{start} – {end} ({w['n']} months)"
+        lines.append(f"{span}: {label}")
+    return lines
+
+
 # ── CSV output ────────────────────────────────────────────────────────────────
 
 def write_cleaned_csv(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path:
@@ -390,7 +522,6 @@ def write_cleaned_csv(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{record.site_id}_cleaned.csv"
     record.enriched_df.to_csv(path, index=False)
-    print(f"[reporter] wrote cleaned CSV   : {path}")
     return path
 
 
@@ -483,82 +614,57 @@ def _print_summary_table(summaries: list) -> None:
 
 
 def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) -> None:
-    """Print per-site tables, a cross-site summary, and write cleaned CSVs."""
+    """Print the cross-site Summary first, then per-site tables, and write cleaned CSVs."""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # allow the ≥ glyph on Windows consoles
+    except Exception:
+        pass
+
     if not records:
         print("[reporter] No records loaded — nothing to report.")
         return
 
+    # Compute every site's summary and write its cleaned CSV up front (silently), so the
+    # cross-site Summary table can print FIRST, before any per-site detail.
     all_summaries = []
-    all_sens: dict = {}
-
     for r in records:
-        summary = summarise_site(r)
-        all_summaries.append(summary)
+        all_summaries.append(summarise_site(r))
         write_cleaned_csv(r, output_dir)
 
-        monthly = summarise_by_month(r)
-        inv_row = summarise_inverters(r)
-        gaps = summarise_gap_months(r)
-
-        # ── Monthly efficiency ────────────────────────────────────────────────
-        print(f"\n{'='*74}")
-        print(f"  {summary['site_name']}")
-        print(f"{'='*74}")
-        print(f"  {'Month':<12}  {'Avg Efficiency':>16}  {'Loss % of Output':>18}  {'Total Energy Lost':>20}")
-        print(f"  {'-'*12}  {'-'*16}  {'-'*18}  {'-'*20}")
-        for _, row in monthly.iterrows():
-            eff      = row["Average Efficiency (%)"]
-            loss_pct = row["Loss % of Output"]
-            energy   = row["Total Energy Lost (kWh)"]
-            eff_str      = f"{eff:>15.2f}%"      if pd.notna(eff)      else f"{'N/A':>15} "
-            loss_pct_str = f"{loss_pct:>15.2f}%"  if pd.notna(loss_pct) else f"{'N/A':>15} "
-            energy_str   = f"{energy:>16.1f} kWh" if pd.notna(energy)   else f"{'N/A':>16}    "
-            print(f"  {row['Month']:<12}  {eff_str}  {loss_pct_str}  {energy_str}")
-        print(f"{'='*74}")
-        avg_eff      = summary["avg_efficiency_pct"]
-        avg_loss_pct = summary["avg_loss_pct"]
-        total_energy = summary["total_energy_lost_kwh"]
-        eff_str      = f"{avg_eff:>15.2f}%"         if pd.notna(avg_eff)      else f"{'N/A':>15} "
-        loss_pct_str = f"{avg_loss_pct:>15.2f}%"    if pd.notna(avg_loss_pct) else f"{'N/A':>15} "
-        energy_str   = f"{total_energy:>16.1f} kWh" if pd.notna(total_energy) else f"{'N/A':>16}    "
-        print(f"  {'OVERALL':<12}  {eff_str}  {loss_pct_str}  {energy_str}")
-        print(f"{'='*74}\n")
-
-        # ── Data gaps (recorded data, but too few clean intervals to report) ──
-        if gaps:
-            print(
-                f"  Data Gaps  (not reported above: < {config.MIN_CLEAN_INTERVALS_PER_MONTH} "
-                f"clean intervals, config-excluded, or a statistical efficiency anomaly)"
-            )
-            print(f"  {'-'*86}")
-            for g in gaps:
-                print(
-                    f"  {g['month']:<10}  clean: {g['clean_rows']:>5,} | meter: {g['meter_rows']:>5,} | "
-                    f"gen: {g['gen_rows']:>5,}   {g['reason']}"
-                )
-            print()
-
-        # ── Curated site notes (config.SITE_NOTES) ────────────────────────────
-        site_notes = config.SITE_NOTES.get(r.site_id, [])
-        if site_notes:
-            print(f"  Notes")
-            print(f"  {'-'*78}")
-            for note in site_notes:
-                print(textwrap.fill(note, width=78, initial_indent="  * ", subsequent_indent="    "))
-            print()
-
-        # ── Inverter power split ──────────────────────────────────────────────
-        inv_keys = [k for k in inv_row if k.startswith("Inverter")]
-        if inv_keys:
-            print(f"  Inverter Power Split")
-            print(f"  {'-'*42}")
-            for k in inv_keys:
-                print(f"  {k:<32}  {inv_row[k]:>6.2f}%")
-            if inv_row.get("Notes"):
-                print(f"  ** {inv_row['Notes']}")
-            print()
-
-        all_sens[r.site_id] = _phase_sensitivity(r)
-
     _print_summary_table(all_summaries)
-    _print_sensitivity_table(all_sens)
+
+    all_sens: dict = {}
+    for r in records:
+        summary = r.summary
+        monthly = summarise_by_month(r)
+
+        # ── Site header ───────────────────────────────────────────────────────
+        bar = "=" * 70
+        print(f"\n{bar}")
+        print(f"  {summary['site_name']}")
+        print(bar)
+
+        # ── Monthly efficiency (good days only) ───────────────────────────────
+        print(f"  {'Month':<10}  {'Good/Bad Days':>13}  {'Avg Efficiency':>16}  {'Total Energy Lost':>20}")
+        print(f"  {'-'*10}  {'-'*13}  {'-'*16}  {'-'*20}")
+        for _, row in monthly.iterrows():
+            eff    = row["Average Efficiency (%)"]
+            energy = row["Total Energy Lost (kWh)"]
+            gb     = f"{int(row['Good Days'])}/{int(row['Bad Days'])}"
+            eff_str    = f"{eff:>15.2f}%"       if pd.notna(eff)    else f"{'N/A':>15} "
+            energy_str = f"{energy:>16.1f} kWh" if pd.notna(energy) else f"{'N/A':>16}    "
+            print(f"  {row['Month']:<10}  {gb:>13}  {eff_str}  {energy_str}")
+        print(bar)
+        avg_eff      = summary["avg_efficiency_pct"]
+        total_energy = summary["total_energy_lost_kwh"]
+        gb_total     = f"{summary['good_days']}/{summary['bad_days']}"
+        eff_str      = f"{avg_eff:>15.2f}%"         if pd.notna(avg_eff)      else f"{'N/A':>15} "
+        energy_str   = f"{total_energy:>16.1f} kWh" if pd.notna(total_energy) else f"{'N/A':>16}    "
+        print(f"  {'OVERALL':<10}  {gb_total:>13}  {eff_str}  {energy_str}")
+        print(f"{bar}\n")
+
+        if VERBOSE:
+            all_sens[r.site_id] = _phase_sensitivity(r)
+
+    if VERBOSE:
+        _print_sensitivity_table(all_sens)

@@ -137,9 +137,16 @@ MAX_PHASE_CURRENT_DEVIATION = 0.30
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.
 INVERTER_IMBALANCE_TOLERANCE_PP = 5
 
-# Minimum fraction of expected daylight intervals that must be clean for a day to be "good".
-# "Daylight" = intervals that survive the nighttime filter (meter > NIGHTTIME_KW_THRESHOLD).
-# Days below this threshold are excluded from monthly and overall efficiency averages.
+# Good-day methodology threshold. Reported efficiency (monthly AND overall) is computed over
+# GOOD DAYS only. A producing day — one with >=1 interval whose meter reads above
+# NIGHTTIME_KW_THRESHOLD — is "good" when at least this fraction of its production intervals
+# survive every cleaning filter; otherwise it is a "bad" day and is excluded from the
+# efficiency figures (its data still appears in the raw input and cleaned CSV). The reporter
+# prints good-vs-bad day counts next to each month's efficiency and for the site overall. The
+# filters themselves are unchanged; this only governs how the surviving intervals are rolled
+# up. 0.70 = a day must have >=70% of its production intervals clean to count. Raising it
+# yields a cleaner but smaller (more selection-biased) sample; lowering it admits dirtier days.
+# See src/reporter.py (_day_quality / _keep_good_days).
 GOOD_DAY_MIN_CLEAN_PCT = 0.70
 
 # Minimum number of clean intervals a calendar month must have for its efficiency to be

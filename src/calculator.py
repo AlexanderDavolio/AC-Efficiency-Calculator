@@ -94,18 +94,4 @@ def run_all_calculations(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_loss_delta(df)
     df = add_time_buckets(df)
 
-    # Energy-weighted efficiency: sum(meter_kw) / sum(inverter_kw), NOT the mean of
-    # per-interval ratios. Each interval is weighted by the energy it carried, which is
-    # the only physically meaningful roll-up. The interval-duration factor cancels, so
-    # summing kW is equivalent to summing kWh. Mask on EFFICIENCY_PCT (NaN when meter is
-    # missing or inverter <= 0) so the two sums stay paired over the same intervals.
-    valid = df[df[config.COL_EFFICIENCY_PCT].notna()]
-    inv_total = valid[config.COL_TOTAL_INVERTER_KW].sum()
-    avg_eff = 100.0 * valid[config.COL_METER_PRODUCTION_KW].sum() / inv_total if inv_total > 0 else float("nan")
-    avg_loss = df[config.COL_LOSS_DELTA_KW].mean()
-    print(
-        f"[calculator] avg efficiency : {avg_eff:.2f}%"
-        f"\n[calculator] avg loss delta : {avg_loss:.3f} kW\n"
-    )
-
     return df
