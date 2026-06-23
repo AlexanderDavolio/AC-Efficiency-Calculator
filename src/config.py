@@ -126,12 +126,15 @@ MIN_GEN_KW_FOR_SHARE_CHECK = 1.0
 # signature of one leg's CT dropping out or saturating while the others hold. This catches
 # faults the energy-share check (MAX_METER_SHARE_DEVIATION) misses: a single phase is only
 # ~1/3 of a station, so a phase dropout moves the station's TOTAL energy too little to trip
-# the share check, yet shows up plainly leg-to-leg. 0.30 = flag a phase >30% off the median
-# of the three; well above normal three-phase imbalance (typically <5%), so only gross
-# single-phase faults trip it. Below MIN_GEN_KW_FOR_SHARE_CHECK the currents are too small
-# and noisy to judge and the row is left alone. Stations missing any of the three phase
-# columns (and sites with no per-phase current data) are skipped entirely.
-MAX_PHASE_CURRENT_DEVIATION = 0.30
+# the share check, yet shows up plainly leg-to-leg. 0.01 = flag a phase >1% off the median
+# of the three. NOTE: this is BELOW normal three-phase imbalance (healthy systems routinely
+# run a few percent of leg-to-leg spread), so it is extremely aggressive and will drop most
+# production intervals — useful for fault isolation, not routine reporting. (0.30 was the
+# prior value: well above normal imbalance, tripping only on gross single-phase faults.)
+# Below MIN_GEN_KW_FOR_SHARE_CHECK the currents are too small and noisy to judge and the row
+# is left alone. Stations missing any of the three phase columns (and sites with no per-phase
+# current data) are skipped entirely.
+MAX_PHASE_CURRENT_DEVIATION = 0.01
 
 # Allowed deviation from equal inverter power share before flagging as imbalanced.
 # E.g., with 3 inverters (equal share = 33.3%), a value of 5 flags anything outside 28–38%.
