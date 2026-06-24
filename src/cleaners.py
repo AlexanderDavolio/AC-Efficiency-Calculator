@@ -4,11 +4,14 @@ Filters are pure: they never mutate the input DataFrame.
 All logic derives from raw sensor columns present in the DataFrame.
 """
 
+import contextlib
+import io
 import re
 
 import pandas as pd
 
 from src import config
+from src import calculator
 
 _INV_KW_COL_RE = re.compile(r"^Inverter \d+ AC kW$")
 
@@ -276,7 +279,8 @@ def filter_meter_comms(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     return result
 
 
-def filter_phase_current(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
+def filter_phase_current(df: pd.DataFrame, site_id: str = "", threshold: float = None,
+                         daytime_only: bool = False) -> pd.DataFrame:
     """Drop intervals where one phase current of a meter station is out of line with the
     other two — a single-phase CT fault while the rest of the station reads normally.
 
@@ -298,13 +302,19 @@ def filter_phase_current(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
        leg is a faulted/dropped CT, not real current — so those rows are dropped outright.
     2. Median-deviation check on the remaining producing rows: per interval, take the median of
        a station's three phase currents and drop the row if any phase deviates from that median
-       by more than config.MAX_PHASE_CURRENT_DEVIATION (a fraction of the median).
+       by more than the deviation threshold (a fraction of the median). The threshold defaults
+       to config.MAX_PHASE_CURRENT_DEVIATION; run_all_filters passes an explicit `threshold` so
+       it can raise the bar per site (the adaptive search) without changing the global default.
 
     The reference median is computed per ROW from the three phases (not a cross-row baseline),
     so it needs no warm-up and can't be corrupted by a run of bad intervals. Rows below the
     producing floor are left alone (phase currents are tiny and noisy at dawn/dusk). Stations
     missing any of the three phase columns are skipped; a site with no per-phase current data
     passes through untouched. Fully automatic and per-interval — no dates, no per-site config.
+
+    `daytime_only` (set by run_all_filters for sites whose inverter telemetry is daytime-only)
+    further restricts eligibility to intervals where the inverters are reporting, so nighttime
+    phantom-load currents can't produce false imbalance flags.
     """
     before = len(df)
     site_tag = f" [{site_id}]" if site_id else ""
@@ -314,8 +324,16 @@ def filter_phase_current(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
         print(f"  filter_phase_current         {site_tag}: dropped {0:>6,} rows | remaining {len(df):,}")
         return df.copy()
 
+    # Deviation threshold: caller override (adaptive search) or the global default.
+    thr = config.MAX_PHASE_CURRENT_DEVIATION if threshold is None else threshold
+
     total_kw = pd.to_numeric(df[config.COL_METER_PRODUCTION_KW], errors="coerce")
     eligible = total_kw >= config.MIN_GEN_KW_FOR_SHARE_CHECK
+
+    # Daytime-only-telemetry sites: only judge phase balance on intervals where the inverters
+    # are actually reporting, so nighttime phantom-load currents can't trip a false imbalance.
+    if daytime_only:
+        eligible = eligible & calculator.telemetry_reporting_mask(df)
 
     # Accumulate faults across every station's phase triple (a row is bad if ANY station is bad).
     hard_raw = pd.Series(False, index=df.index)   # any phase reads negative
@@ -325,7 +343,7 @@ def filter_phase_current(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
         hard_raw |= (phases < 0).any(axis=1)
         med = phases.median(axis=1)
         rel_dev = phases.sub(med, axis=0).abs().div(med.where(med > 0), axis=0)
-        dev_raw |= (rel_dev > config.MAX_PHASE_CURRENT_DEVIATION).any(axis=1)
+        dev_raw |= (rel_dev > thr).any(axis=1)
 
     # Stage 1 hard faults, then stage 2 deviation on the producing rows that aren't already hard.
     hard_fault = eligible & hard_raw
@@ -363,23 +381,127 @@ def filter_gross_outliers(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     return result
 
 
+def _apply_filter_stack(df: pd.DataFrame, site_id: str, phase_threshold: float,
+                        quiet: bool, daytime_only: bool = False) -> pd.DataFrame:
+    """Run the six cleaning filters in order at one phase threshold and return the result.
+
+    `quiet` suppresses each filter's own progress line — used while the adaptive search tries
+    candidate thresholds, so only the final chosen run prints. `daytime_only` is forwarded to
+    filter_phase_current to scope it to reporting intervals. The filters are pure, so this can
+    be called repeatedly on the same input without side effects.
+    """
+    ctx = contextlib.redirect_stdout(io.StringIO()) if quiet else contextlib.nullcontext()
+    with ctx:
+        out = filter_value_spikes(df, site_id)
+        out = filter_inverter_active(out, site_id)
+        out = filter_inverter_comms(out, site_id)
+        out = filter_meter_comms(out, site_id)
+        out = filter_phase_current(out, site_id, threshold=phase_threshold, daytime_only=daytime_only)
+        out = filter_gross_outliers(out, site_id)
+    return out
+
+
+def _count_good_days(raw_df: pd.DataFrame, kept_index, daytime_only: bool = False) -> int:
+    """Number of GOOD days in raw_df given the row indices that survived cleaning.
+
+    Mirrors reporter._day_quality's definition (kept here so run_all_filters can drive the
+    adaptive search without importing the reporter): a producing day has >=1 raw interval with
+    meter > config.NIGHTTIME_KW_THRESHOLD, and is GOOD when at least config.GOOD_DAY_MIN_CLEAN_PCT
+    of its producing intervals survived cleaning. The two definitions must stay in sync.
+
+    For `daytime_only` sites the denominator is restricted to reporting (daytime) intervals —
+    intervals where inverters are blank by design can never be clean, so counting them would
+    structurally cap the fraction below the good-day bar (see calculator.is_daytime_only_telemetry).
+    """
+    if raw_df is None or len(raw_df) == 0:
+        return 0
+    ts = pd.to_datetime(raw_df[config.COL_TIMESTAMP], errors="coerce")
+    meter = pd.to_numeric(raw_df[config.COL_METER_PRODUCTION_KW], errors="coerce")
+    denom = meter > config.NIGHTTIME_KW_THRESHOLD
+    if daytime_only:
+        denom = denom & calculator.telemetry_reporting_mask(raw_df)
+    work = pd.DataFrame({
+        "date":  ts.dt.normalize(),
+        "prod":  denom.to_numpy(),
+        "clean": raw_df.index.isin(kept_index),
+    })
+    work = work[work["prod"] & work["date"].notna()]
+    if work.empty:
+        return 0
+    grp = work.groupby("date")
+    frac = grp["clean"].sum() / grp.size()
+    return int((frac >= config.GOOD_DAY_MIN_CLEAN_PCT).sum())
+
+
 def run_all_filters(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
-    """Apply all filters in order and return the cleaned DataFrame."""
+    """Apply all six filters in order, adapting the phase-current threshold per site.
+
+    The phase-current threshold starts at config.MAX_PHASE_CURRENT_DEVIATION and, if the site
+    yields fewer than config.MIN_GOOD_DAYS_ADAPTIVE good days, is raised by
+    config.ADAPTIVE_THRESHOLD_STEP and the whole stack re-run — repeating until the site
+    reaches the good-day floor or the threshold hits config.MAX_PHASE_CURRENT_DEVIATION_CEILING.
+    The chosen threshold is used for this site's returned (final) frame. The adaptation is
+    per-site and independent: it reads only this site's own good-day count, never another
+    site's, and never any per-site-hardcoded value. Search metadata is attached to the returned
+    frame's .attrs for the reporter (phase_threshold_used / _iterations / _hit_ceiling /
+    _good_days / _ceiling). Every other filter is unchanged.
+    """
     rows_in = len(df)
     site_tag = f" [{site_id}]" if site_id else ""
+
+    start    = config.MAX_PHASE_CURRENT_DEVIATION
+    step     = config.ADAPTIVE_THRESHOLD_STEP
+    ceiling  = config.MAX_PHASE_CURRENT_DEVIATION_CEILING
+    target   = config.MIN_GOOD_DAYS_ADAPTIVE
+    has_phase = bool(_phase_current_groups(df))   # raising the bar is pointless without phases
+
+    # Detect daytime-only inverter telemetry once, on the original frame (which still carries
+    # the nighttime NULLs). When set, the good-day denominator and the phase filter are scoped
+    # to reporting (daytime) intervals. Logged once so the adjustment is visible in output.
+    daytime_only = calculator.is_daytime_only_telemetry(df)
+    if daytime_only:
+        pct = int(calculator.DAYTIME_ONLY_NIGHT_NULL_RATE * 100)
+        print(f"[cleaners]{site_tag} WARNING: daytime-only inverter telemetry detected "
+              f"(>{pct}% of nighttime intervals have no inverter data) — scoping good-day "
+              f"denominator and phase-current filter to daytime (reporting) intervals")
+
+    # ── Adaptive search (silent): step the phase threshold up until the site clears the
+    #    good-day floor or we reach the ceiling. ────────────────────────────────────────────
+    threshold = min(start, ceiling)
+    iterations = 0
+    good_days = 0
+    while True:
+        iterations += 1
+        cleaned = _apply_filter_stack(df, site_id, threshold, quiet=True, daytime_only=daytime_only)
+        good_days = _count_good_days(df, cleaned.index, daytime_only=daytime_only)
+        if good_days >= target or threshold >= ceiling or not has_phase:
+            break
+        threshold = min(round(threshold + step, 10), ceiling)
+    hit_ceiling = has_phase and good_days < target  # below target only when stuck at the ceiling
+
+    # ── Final run at the chosen threshold, with the usual per-filter logging. ──────────────
     print(f"\n[cleaners]{site_tag} starting: {rows_in:,} rows")
-
-    df = filter_value_spikes(df, site_id)
-    df = filter_inverter_active(df, site_id)
-    df = filter_inverter_comms(df, site_id)
-    df = filter_meter_comms(df, site_id)
-    df = filter_phase_current(df, site_id)
-    df = filter_gross_outliers(df, site_id)
-
-    rows_out = len(df)
+    cleaned = _apply_filter_stack(df, site_id, threshold, quiet=False, daytime_only=daytime_only)
+    rows_out = len(cleaned)
+    pct = (rows_in - rows_out) / rows_in * 100 if rows_in else 0.0
     print(
         f"[cleaners]{site_tag} finished: {rows_out:,} rows remaining "
-        f"({rows_in - rows_out:,} total dropped, "
-        f"{(rows_in - rows_out) / rows_in * 100:.1f}%)\n"
+        f"({rows_in - rows_out:,} total dropped, {pct:.1f}%)"
     )
-    return df
+    if hit_ceiling:
+        print(f"[cleaners]{site_tag} phase threshold reached ceiling {ceiling:g} "
+              f"({iterations} iterations) — only {good_days} good days (target {target})")
+    elif iterations > 1:
+        print(f"[cleaners]{site_tag} phase threshold auto-adjusted to {threshold:g} "
+              f"({iterations} iterations) — {good_days} good days")
+    else:
+        print(f"[cleaners]{site_tag} phase threshold {threshold:g} "
+              f"(1 iteration) — {good_days} good days")
+    print()
+
+    cleaned.attrs["phase_threshold_used"]        = threshold
+    cleaned.attrs["phase_threshold_iterations"]  = iterations
+    cleaned.attrs["phase_threshold_hit_ceiling"] = hit_ceiling
+    cleaned.attrs["phase_threshold_good_days"]   = good_days
+    cleaned.attrs["phase_threshold_ceiling"]     = ceiling
+    return cleaned
