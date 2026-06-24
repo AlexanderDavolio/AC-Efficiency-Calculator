@@ -154,6 +154,24 @@ INVERTER_IMBALANCE_TOLERANCE_PP = 5
 # See src/reporter.py (_day_quality / _keep_good_days).
 GOOD_DAY_MIN_CLEAN_PCT = 0.70
 
+# ── Adaptive per-site phase-current threshold ──────────────────────────────────
+# cleaners.run_all_filters does not treat MAX_PHASE_CURRENT_DEVIATION as a fixed value; it uses
+# it as the STARTING point of a per-site search. For each site it runs the full filter stack,
+# counts good days (GOOD_DAY_MIN_CLEAN_PCT basis), and if the site has fewer than
+# MIN_GOOD_DAYS_ADAPTIVE good days it raises that site's phase threshold by
+# ADAPTIVE_THRESHOLD_STEP and re-runs the whole stack — repeating until the site reaches
+# MIN_GOOD_DAYS_ADAPTIVE good days or the threshold reaches MAX_PHASE_CURRENT_DEVIATION_CEILING.
+# Whatever value a site lands on is used for that site's final output. Each site adapts
+# independently; the value one site needs never changes another, and the global start above is
+# the same for all. This keeps a strict global default on well-behaved single-meter sites while
+# automatically loosening for sites whose phase imbalance (e.g. French's three meter stations)
+# would otherwise wipe them out. No per-site values are hardcoded anywhere — the search is
+# driven entirely by each site's own good-day count. The chosen threshold and iteration count
+# are reported per site (see src/reporter.py _phase_threshold_note).
+MIN_GOOD_DAYS_ADAPTIVE = 20                  # good-day floor each site tries to reach
+ADAPTIVE_THRESHOLD_STEP = 0.01               # amount the phase threshold rises each retry
+MAX_PHASE_CURRENT_DEVIATION_CEILING = 0.30   # phase threshold is never raised above this
+
 # Minimum number of clean intervals a calendar month must have for its efficiency to be
 # reported. A month with only a handful of surviving intervals yields a statistically
 # meaningless figure (e.g. 131% from a few timing-jittered rows, or a "declining" trend
