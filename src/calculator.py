@@ -16,6 +16,77 @@ def _inverter_kw_cols(df: pd.DataFrame) -> list:
     return sorted(cols, key=lambda c: int(re.search(r"\d+", c).group()))
 
 
+# ── Daytime-only inverter telemetry detection ──────────────────────────────────
+# Some sites' DAS records NOTHING for inverters at night — the channels are blank/NULL — rather
+# than recording an explicit zero. The loaders sum the per-string kWh with sum(skipna=True), so
+# an all-NULL nighttime row collapses to 0.0 in the derived "Inverter N AC kW" columns; by the
+# time the cleaned/enriched frame exists the "absent" signal is gone (a daytime-only site looks
+# identical to one that records zeros). To tell them apart we read the ORIGINAL per-string
+# inverter columns the loader leaves in place ("Inverter 01", "Inverter (PS1) A", …) — NOT the
+# derived "Inverter N AC kW" columns, whose NULLs are already 0.
+#
+# A daytime-only-telemetry site structurally caps its good-day fraction: nighttime/dawn
+# intervals where the meter shows load but the inverters are blank can never be "clean", and the
+# phase-current check sees only phantom nighttime currents. cleaners/reporter use the detection
+# below to scope the good-day denominator and the phase filter to reporting (daytime) intervals.
+# Detection is data-driven and site-agnostic — no site name appears anywhere.
+
+_NIGHT_HOURS = range(0, 6)                  # 00:00–05:59 nighttime proxy
+DAYTIME_ONLY_NIGHT_NULL_RATE = 0.95         # >95% nighttime NULL => daytime-only telemetry
+_RAW_INV_NAME_RE = re.compile(r"inverter|\binv\b", re.IGNORECASE)
+
+
+def _raw_inverter_telemetry_cols(df: pd.DataFrame) -> list:
+    """Original per-string inverter columns that still carry NULLs.
+
+    Excludes the derived 'Inverter N AC kW' columns (whose nighttime NULLs were collapsed to 0
+    at load) and the plural 'Inverters' aggregate. These are the columns whose blank-vs-zero
+    pattern reveals daytime-only telemetry.
+    """
+    cols = []
+    for c in df.columns:
+        name = str(c)
+        if _INV_KW_COL_RE.match(name):          # derived kW channel — NULLs already 0
+            continue
+        if "inverters" in name.lower():         # plural aggregate, not a per-string channel
+            continue
+        if _RAW_INV_NAME_RE.search(name):
+            cols.append(c)
+    return cols
+
+
+def telemetry_reporting_mask(df: pd.DataFrame) -> pd.Series:
+    """Per-row boolean: at least one original inverter channel is non-null (the DAS is reporting
+    that interval). For a daytime-only-telemetry site this marks the daytime window. Sites with
+    no original per-string inverter columns are treated as always reporting (mask all True)."""
+    cols = _raw_inverter_telemetry_cols(df)
+    if not cols:
+        return pd.Series(True, index=df.index)
+    return df[cols].notna().any(axis=1)
+
+
+def is_daytime_only_telemetry(df: pd.DataFrame) -> bool:
+    """True when inverter telemetry is daytime-only: more than DAYTIME_ONLY_NIGHT_NULL_RATE of
+    nighttime (hours 0–5) intervals have EVERY original inverter channel blank/NULL — the DAS
+    records nothing at night instead of recording zero.
+
+    Must run on a frame that still has the original inverter columns (the loaded raw_df), since
+    the derived 'Inverter N AC kW' columns no longer carry the NULLs. Site-agnostic.
+    """
+    cols = _raw_inverter_telemetry_cols(df)
+    if not cols or config.COL_TIMESTAMP not in df.columns:
+        return False
+    ts = pd.to_datetime(df[config.COL_TIMESTAMP], errors="coerce")
+    night = ts.dt.hour.isin(_NIGHT_HOURS)
+    if not night.any():
+        return False
+    night_rows = df.loc[night, cols]
+    if night_rows.empty:
+        return False
+    null_rate = night_rows.isna().all(axis=1).mean()
+    return bool(null_rate > DAYTIME_ONLY_NIGHT_NULL_RATE)
+
+
 def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
     """Add INVERTER_TOTAL_KW and EFFICIENCY_PCT columns to the DataFrame.
 
