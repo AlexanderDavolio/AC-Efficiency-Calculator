@@ -14,6 +14,7 @@ from tabulate import tabulate
 
 from src.models import SiteRecord
 from src import config
+from src import calculator
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -72,10 +73,16 @@ def _day_quality(record: SiteRecord) -> pd.DataFrame:
     clean_idx = record.enriched_df.index
     ts = pd.to_datetime(raw[config.COL_TIMESTAMP], errors="coerce")
     meter = pd.to_numeric(raw[config.COL_METER_PRODUCTION_KW], errors="coerce")
+    # Producing-interval denominator. For daytime-only-telemetry sites, restrict it to reporting
+    # (daytime) intervals so structurally-blank nighttime intervals don't cap the good-day
+    # fraction. Must match cleaners._count_good_days, which the adaptive search uses.
+    prod = meter > config.NIGHTTIME_KW_THRESHOLD
+    if calculator.is_daytime_only_telemetry(raw):
+        prod = prod & calculator.telemetry_reporting_mask(raw)
     work = pd.DataFrame({
         "date":   ts.dt.normalize(),
         "period": ts.dt.to_period("M"),
-        "prod":   (meter > config.NIGHTTIME_KW_THRESHOLD).to_numpy(),
+        "prod":   prod.to_numpy(),
         "clean":  raw.index.isin(clean_idx),
     })
     work = work[work["prod"] & work["date"].notna()]
@@ -211,8 +218,16 @@ def summarise_site(record: SiteRecord) -> dict:
     good_days = int(dq["good"].sum())
     bad_days  = int(len(dq) - good_days)
 
+    # Adaptive phase-threshold metadata recorded by cleaners.run_all_filters (on cleaned_df.attrs).
+    # auto = it took more than one iteration, i.e. it was stepped up from the global default.
+    attrs = getattr(record.cleaned_df, "attrs", None) or {}
+    phase_threshold_used = attrs.get("phase_threshold_used")
+    phase_threshold_auto = int(attrs.get("phase_threshold_iterations", 1)) > 1
+
     summary = {
         "site_name":          record.site_id,
+        "phase_threshold_used": phase_threshold_used,
+        "phase_threshold_auto": phase_threshold_auto,
         "total_raw_rows":     len(record.raw_df),
         "clean_rows":         len(full),
         "clean_row_pct":      round(len(full) / len(record.raw_df) * 100, 2),
@@ -525,6 +540,132 @@ def write_cleaned_csv(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path
     return path
 
 
+# ── Per-day diagnostic (sites that triggered the adaptive phase threshold) ──────
+# Filter labels, in pipeline order, for the per-day kill attribution. Each producing interval
+# is charged to the FIRST filter that removed it; the day's "primary kill filter" is whichever
+# charged the most. This is purely a read-only replay of the existing filters at the site's
+# chosen phase threshold — no filter logic is modified.
+_DIAG_FILTER_STEPS = [
+    ("Value Spikes",    "filter_value_spikes"),
+    ("Inverter Active", "filter_inverter_active"),
+    ("Inverter Comms",  "filter_inverter_comms"),
+    ("Meter Comms",     "filter_meter_comms"),
+    ("Phase Current",   "filter_phase_current"),
+    ("Gross Outliers",  "filter_gross_outliers"),
+]
+
+
+def _daily_diagnostic_frame(record: SiteRecord) -> pd.DataFrame:
+    """One row per calendar day present in the site's raw data, classifying it good/bad and
+    attributing each producing interval to the filter that removed it.
+
+    Re-runs the six filters in order at the site's chosen phase threshold (from
+    cleaned_df.attrs). The filters are pure, so this never mutates the record or pipeline
+    state. Producing day / good-day definitions match cleaners._count_good_days and
+    reporter._day_quality: a producing interval has raw meter > NIGHTTIME_KW_THRESHOLD; a
+    producing day is GOOD when at least GOOD_DAY_MIN_CLEAN_PCT of those intervals survive all
+    six filters. Counts and kill attribution are over producing intervals only.
+    """
+    from src import cleaners
+
+    raw = record.raw_df
+    sid = record.site_id
+    attrs = getattr(record.cleaned_df, "attrs", None) or {}
+    threshold = attrs.get("phase_threshold_used")  # None -> filters use the global default
+
+    ts = pd.to_datetime(raw[config.COL_TIMESTAMP], errors="coerce")
+    date = ts.dt.normalize()
+    meter = pd.to_numeric(raw[config.COL_METER_PRODUCTION_KW], errors="coerce")
+    prod = (meter > config.NIGHTTIME_KW_THRESHOLD).to_numpy()
+
+    # Replay the stack, charging each removed row to the first filter that dropped it.
+    kill = pd.Series(pd.NA, index=raw.index, dtype="object")
+    df = raw
+    prev = raw.index
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink):
+        for label, fname in _DIAG_FILTER_STEPS:
+            fn = getattr(cleaners, fname)
+            df = fn(df, sid, threshold=threshold) if fname == "filter_phase_current" else fn(df, sid)
+            removed = prev.difference(df.index)
+            kill.loc[removed] = label
+            prev = df.index
+
+    work = pd.DataFrame({"date": date, "prod": prod, "kill": kill.to_numpy()})
+    work = work[work["date"].notna()]
+
+    rows = []
+    for d, sub in work.groupby("date"):
+        prod_sub = sub[sub["prod"]]
+        n_prod = len(prod_sub)
+        killed = prod_sub["kill"].dropna()      # producing intervals removed, labelled by filter
+        n_surv = n_prod - len(killed)
+        if n_prod == 0:                         # day present but no production (winter/all-night)
+            rows.append({
+                "Date": str(d.date()), "Good/Bad": "", "Clean Fraction": "",
+                "Producing Intervals": 0, "Surviving Intervals": 0,
+                "Primary Kill Filter": "", "Intervals Killed": 0,
+            })
+            continue
+        frac = n_surv / n_prod
+        if len(killed):
+            vc = killed.value_counts()
+            primary, n_killed = str(vc.index[0]), int(vc.iloc[0])
+        else:
+            primary, n_killed = "None (all survived)", 0
+        rows.append({
+            "Date": str(d.date()),
+            "Good/Bad": "Good" if frac >= config.GOOD_DAY_MIN_CLEAN_PCT else "Bad",
+            "Clean Fraction": f"{frac * 100:.1f}%",
+            "Producing Intervals": n_prod,
+            "Surviving Intervals": n_surv,
+            "Primary Kill Filter": primary,
+            "Intervals Killed": n_killed,
+        })
+    return pd.DataFrame(rows)
+
+
+def write_daily_diagnostic(record: SiteRecord, output_dir: Path = OUTPUT_DIR) -> Path:
+    """Write a formatted per-day diagnostic workbook for one site and return the path.
+
+    Green rows = good days, red rows = bad days, header frozen, columns auto-fit. Intended for
+    sites that triggered the adaptive phase threshold (see run_all_reports).
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    frame = _daily_diagnostic_frame(record)
+    headers = ["Date", "Good/Bad", "Clean Fraction", "Producing Intervals",
+               "Surviving Intervals", "Primary Kill Filter", "Intervals Killed"]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Daily Diagnostic"
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    green = PatternFill("solid", fgColor="C6EFCE")  # Excel "good" green
+    red = PatternFill("solid", fgColor="FFC7CE")    # Excel "bad" red
+    for _, r in frame.iterrows():
+        ws.append([r[h] for h in headers])
+        fill = green if r["Good/Bad"] == "Good" else red if r["Good/Bad"] == "Bad" else None
+        if fill is not None:
+            for cell in ws[ws.max_row]:
+                cell.fill = fill
+
+    ws.freeze_panes = "A2"  # keep the header visible while scrolling
+    for col_cells in ws.columns:
+        longest = max((len(str(c.value)) for c in col_cells if c.value is not None), default=0)
+        ws.column_dimensions[col_cells[0].column_letter].width = longest + 2
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{record.site_id}_daily_diagnostic.xlsx"
+    wb.save(path)
+    return path
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def _phase_sensitivity(record: SiteRecord) -> list:
@@ -594,23 +735,70 @@ def _print_sensitivity_table(all_sens: dict) -> None:
 
 
 def _print_summary_table(summaries: list) -> None:
-    """Print a one-row-per-site summary table."""
-    print(f"\n{'='*86}")
+    """Print a one-row-per-site summary table. The Phase Threshold column shows the value the
+    adaptive search actually used for each site, with a '*' when it was auto-adjusted from the
+    global default (more than one iteration); a footnote is shown when any '*' appears."""
+    width = 103
+    print(f"\n{'='*width}")
     print(f"  Summary")
-    print(f"{'='*86}")
-    print(f"  {'Site':<22}  {'Date Range':<23}  {'Avg Efficiency':>16}  {'Total Energy Lost':>20}")
-    print(f"  {'-'*22}  {'-'*23}  {'-'*16}  {'-'*20}")
+    print(f"{'='*width}")
+    print(f"  {'Site':<22}  {'Date Range':<23}  {'Phase Threshold':>15}  "
+          f"{'Avg Efficiency':>16}  {'Total Energy Lost':>20}")
+    print(f"  {'-'*22}  {'-'*23}  {'-'*15}  {'-'*16}  {'-'*20}")
+    any_auto = False
     for s in summaries:
         date_range   = (
             f"{s['date_range_start']} – {s['date_range_end']}"
             if s["date_range_start"] else "N/A"
         )
+        used = s.get("phase_threshold_used")
+        if used is None:
+            phase_str = f"{'N/A':>15}"
+        else:
+            mark = " *" if s.get("phase_threshold_auto") else ""
+            any_auto = any_auto or bool(mark)
+            phase_str = f"{_fmt_thr(used) + mark:>15}"
         avg_eff      = s["avg_efficiency_pct"]
         total_energy = s["total_energy_lost_kwh"]
         eff_str    = f"{avg_eff:>15.2f}%"         if pd.notna(avg_eff)      else f"{'N/A':>15} "
         energy_str = f"{total_energy:>16.1f} kWh" if pd.notna(total_energy) else f"{'N/A':>16}    "
-        print(f"  {s['site_name']:<22}  {date_range:<23}  {eff_str}  {energy_str}")
-    print(f"{'='*86}\n")
+        print(f"  {s['site_name']:<22}  {date_range:<23}  {phase_str}  {eff_str}  {energy_str}")
+    print(f"{'='*width}")
+    if any_auto:
+        print("  * phase threshold auto-adjusted from default")
+    print()
+
+
+def _fmt_thr(x: float) -> str:
+    """Format a phase threshold for display. Two decimals for the normal config (step 0.01),
+    extending precision only if two decimals would misrepresent a finer custom step."""
+    s = f"{x:.2f}"
+    if abs(float(s) - x) > 1e-9:
+        s = f"{x:.4f}".rstrip("0").rstrip(".")
+    return s
+
+
+def _phase_threshold_note(record: SiteRecord) -> str:
+    """One-line description of the per-site adaptive phase threshold, built from the metadata
+    cleaners.run_all_filters stored on cleaned_df.attrs. Returns '' if no metadata is present.
+
+    - Reached the good-day floor without adjusting:  'Phase threshold 0.04 (1 iteration)'
+    - Stepped up and reached it:  'Phase threshold auto-adjusted to 0.10 (7 iterations)'
+    - Hit the ceiling first:  'Phase threshold reached ceiling 0.30 — only 5 good days found'
+    """
+    attrs = getattr(record.cleaned_df, "attrs", None) or {}
+    if "phase_threshold_used" not in attrs:
+        return ""
+    used    = _fmt_thr(attrs["phase_threshold_used"])
+    iters   = int(attrs.get("phase_threshold_iterations", 1))
+    it_word = "iteration" if iters == 1 else "iterations"
+    if attrs.get("phase_threshold_hit_ceiling"):
+        ceiling = _fmt_thr(attrs.get("phase_threshold_ceiling", attrs["phase_threshold_used"]))
+        good    = int(attrs.get("phase_threshold_good_days", 0))
+        return f"Phase threshold reached ceiling {ceiling} — only {good} good days found"
+    if iters > 1:
+        return f"Phase threshold auto-adjusted to {used} ({iters} {it_word})"
+    return f"Phase threshold {used} ({iters} {it_word})"
 
 
 def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) -> None:
@@ -630,6 +818,13 @@ def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) ->
     for r in records:
         all_summaries.append(summarise_site(r))
         write_cleaned_csv(r, output_dir)
+        # Sites that triggered the adaptive phase threshold (more than one iteration) get a
+        # per-day diagnostic workbook. Isolated so an export error can't break the report.
+        if r.summary.get("phase_threshold_auto"):
+            try:
+                write_daily_diagnostic(r, output_dir)
+            except Exception as exc:  # pragma: no cover - diagnostic is best-effort
+                print(f"[reporter] could not write daily diagnostic for {r.site_id}: {exc}")
 
     _print_summary_table(all_summaries)
 
@@ -643,6 +838,12 @@ def run_all_reports(records: List[SiteRecord], output_dir: Path = OUTPUT_DIR) ->
         print(f"\n{bar}")
         print(f"  {summary['site_name']}")
         print(bar)
+
+        # ── Adaptive phase-threshold note (what the search landed on for this site) ──
+        note = _phase_threshold_note(r)
+        if note:
+            print(f"  {note}")
+            print()
 
         # ── Monthly efficiency (good days only) ───────────────────────────────
         print(f"  {'Month':<10}  {'Good/Bad Days':>13}  {'Avg Efficiency':>16}  {'Total Energy Lost':>20}")
