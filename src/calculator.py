@@ -87,6 +87,62 @@ def is_daytime_only_telemetry(df: pd.DataFrame) -> bool:
     return bool(null_rate > DAYTIME_ONLY_NIGHT_NULL_RATE)
 
 
+# ── Good-day classification (single source of truth) ───────────────────────────
+# The good-day methodology is shared by the adaptive search in cleaners.run_all_filters and by
+# the reporter's monthly/site roll-ups. It lives HERE — the one module both already import — so
+# there is exactly one definition (cleaners.count-of-good-days and reporter._day_quality both
+# delegate). A producing day has >=1 raw interval with meter > config.NIGHTTIME_KW_THRESHOLD;
+# for daytime-only-telemetry sites the producing denominator is restricted to reporting (daytime)
+# intervals (see is_daytime_only_telemetry). A day is GOOD when at least
+# config.GOOD_DAY_MIN_CLEAN_PCT of its producing intervals survived cleaning (appear in kept_index).
+
+_DAY_QUALITY_COLUMNS = ["period", "n_prod", "n_clean", "frac", "good"]
+
+
+def day_quality(df: pd.DataFrame, kept_index, daytime_only=None) -> pd.DataFrame:
+    """One row per producing calendar day, classified good/bad — the single source of truth.
+
+    `df` is the loaded raw frame; `kept_index` are the row indices that survived cleaning.
+    `daytime_only` forces the daytime-denominator scoping when True/False, or auto-detects it
+    when None (the default). Returns a DataFrame indexed by normalised date with columns:
+    period (monthly Period), n_prod, n_clean, frac, good. Days with no production are omitted;
+    no producing days at all yields an empty frame with those columns.
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=_DAY_QUALITY_COLUMNS)
+    ts = pd.to_datetime(df[config.COL_TIMESTAMP], errors="coerce")
+    meter = pd.to_numeric(df[config.COL_METER_PRODUCTION_KW], errors="coerce")
+    prod = meter > config.NIGHTTIME_KW_THRESHOLD
+    if daytime_only is None:
+        daytime_only = is_daytime_only_telemetry(df)
+    if daytime_only:
+        prod = prod & telemetry_reporting_mask(df)
+    work = pd.DataFrame({
+        "date":   ts.dt.normalize(),
+        "period": ts.dt.to_period("M"),
+        "prod":   prod.to_numpy(),
+        "clean":  df.index.isin(kept_index),
+    })
+    work = work[work["prod"] & work["date"].notna()]
+    if work.empty:
+        return pd.DataFrame(columns=_DAY_QUALITY_COLUMNS)
+    grp = work.groupby("date")
+    out = pd.DataFrame({
+        "period":  grp["period"].first(),
+        "n_prod":  grp.size(),
+        "n_clean": grp["clean"].sum(),
+    })
+    out["frac"] = out["n_clean"] / out["n_prod"]
+    out["good"] = out["frac"] >= config.GOOD_DAY_MIN_CLEAN_PCT
+    return out
+
+
+def count_good_days(df: pd.DataFrame, kept_index, daytime_only=None) -> int:
+    """Number of GOOD days for the site (see day_quality)."""
+    dq = day_quality(df, kept_index, daytime_only=daytime_only)
+    return int(dq["good"].sum()) if not dq.empty else 0
+
+
 def calculate_efficiency(df: pd.DataFrame) -> pd.DataFrame:
     """Add INVERTER_TOTAL_KW and EFFICIENCY_PCT columns to the DataFrame.
 

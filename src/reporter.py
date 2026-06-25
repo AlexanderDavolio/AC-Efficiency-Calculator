@@ -62,41 +62,14 @@ def _drop_periods(df: pd.DataFrame, periods: set) -> pd.DataFrame:
 def _day_quality(record: SiteRecord) -> pd.DataFrame:
     """One row per producing calendar day, classified good/bad for the good-day methodology.
 
-    A producing day has >=1 interval whose raw meter reading exceeds
-    config.NIGHTTIME_KW_THRESHOLD. The day is "good" when the fraction of those production
-    intervals that survive every cleaning filter (i.e. appear in enriched_df) is at least
-    config.GOOD_DAY_MIN_CLEAN_PCT; otherwise it is "bad". Returns a DataFrame indexed by date
-    (normalised Timestamp) with columns: period (monthly Period), n_prod, n_clean, frac, good.
-    Days with no production at all are omitted — they are neither good nor bad, just dark.
+    Thin adapter over calculator.day_quality — the single source of truth shared with the
+    adaptive search in cleaners.run_all_filters. A producing day has >=1 interval whose raw
+    meter exceeds config.NIGHTTIME_KW_THRESHOLD (daytime-only sites: restricted to reporting
+    intervals); it is "good" when at least config.GOOD_DAY_MIN_CLEAN_PCT of those intervals
+    survived cleaning. Returns a DataFrame indexed by date with columns period, n_prod, n_clean,
+    frac, good (empty frame with those columns when there are no producing days).
     """
-    raw = record.raw_df
-    clean_idx = record.enriched_df.index
-    ts = pd.to_datetime(raw[config.COL_TIMESTAMP], errors="coerce")
-    meter = pd.to_numeric(raw[config.COL_METER_PRODUCTION_KW], errors="coerce")
-    # Producing-interval denominator. For daytime-only-telemetry sites, restrict it to reporting
-    # (daytime) intervals so structurally-blank nighttime intervals don't cap the good-day
-    # fraction. Must match cleaners._count_good_days, which the adaptive search uses.
-    prod = meter > config.NIGHTTIME_KW_THRESHOLD
-    if calculator.is_daytime_only_telemetry(raw):
-        prod = prod & calculator.telemetry_reporting_mask(raw)
-    work = pd.DataFrame({
-        "date":   ts.dt.normalize(),
-        "period": ts.dt.to_period("M"),
-        "prod":   prod.to_numpy(),
-        "clean":  raw.index.isin(clean_idx),
-    })
-    work = work[work["prod"] & work["date"].notna()]
-    if work.empty:
-        return pd.DataFrame(columns=["period", "n_prod", "n_clean", "frac", "good"])
-    grp = work.groupby("date")
-    out = pd.DataFrame({
-        "period":  grp["period"].first(),
-        "n_prod":  grp.size(),
-        "n_clean": grp["clean"].sum(),
-    })
-    out["frac"] = out["n_clean"] / out["n_prod"]
-    out["good"] = out["frac"] >= config.GOOD_DAY_MIN_CLEAN_PCT
-    return out
+    return calculator.day_quality(record.raw_df, record.enriched_df.index)
 
 
 def _good_day_dates(record: SiteRecord) -> set:
@@ -561,10 +534,10 @@ def _daily_diagnostic_frame(record: SiteRecord) -> pd.DataFrame:
 
     Re-runs the six filters in order at the site's chosen phase threshold (from
     cleaned_df.attrs). The filters are pure, so this never mutates the record or pipeline
-    state. Producing day / good-day definitions match cleaners._count_good_days and
-    reporter._day_quality: a producing interval has raw meter > NIGHTTIME_KW_THRESHOLD; a
-    producing day is GOOD when at least GOOD_DAY_MIN_CLEAN_PCT of those intervals survive all
-    six filters. Counts and kill attribution are over producing intervals only.
+    state. Producing day / good-day definitions match calculator.day_quality (the single
+    source of truth): a producing interval has raw meter > NIGHTTIME_KW_THRESHOLD; a producing
+    day is GOOD when at least GOOD_DAY_MIN_CLEAN_PCT of those intervals survive all six filters.
+    Counts and kill attribution are over producing intervals only.
     """
     from src import cleaners
 

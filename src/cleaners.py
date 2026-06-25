@@ -401,38 +401,6 @@ def _apply_filter_stack(df: pd.DataFrame, site_id: str, phase_threshold: float,
     return out
 
 
-def _count_good_days(raw_df: pd.DataFrame, kept_index, daytime_only: bool = False) -> int:
-    """Number of GOOD days in raw_df given the row indices that survived cleaning.
-
-    Mirrors reporter._day_quality's definition (kept here so run_all_filters can drive the
-    adaptive search without importing the reporter): a producing day has >=1 raw interval with
-    meter > config.NIGHTTIME_KW_THRESHOLD, and is GOOD when at least config.GOOD_DAY_MIN_CLEAN_PCT
-    of its producing intervals survived cleaning. The two definitions must stay in sync.
-
-    For `daytime_only` sites the denominator is restricted to reporting (daytime) intervals —
-    intervals where inverters are blank by design can never be clean, so counting them would
-    structurally cap the fraction below the good-day bar (see calculator.is_daytime_only_telemetry).
-    """
-    if raw_df is None or len(raw_df) == 0:
-        return 0
-    ts = pd.to_datetime(raw_df[config.COL_TIMESTAMP], errors="coerce")
-    meter = pd.to_numeric(raw_df[config.COL_METER_PRODUCTION_KW], errors="coerce")
-    denom = meter > config.NIGHTTIME_KW_THRESHOLD
-    if daytime_only:
-        denom = denom & calculator.telemetry_reporting_mask(raw_df)
-    work = pd.DataFrame({
-        "date":  ts.dt.normalize(),
-        "prod":  denom.to_numpy(),
-        "clean": raw_df.index.isin(kept_index),
-    })
-    work = work[work["prod"] & work["date"].notna()]
-    if work.empty:
-        return 0
-    grp = work.groupby("date")
-    frac = grp["clean"].sum() / grp.size()
-    return int((frac >= config.GOOD_DAY_MIN_CLEAN_PCT).sum())
-
-
 def run_all_filters(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     """Apply all six filters in order, adapting the phase-current threshold per site.
 
@@ -473,7 +441,7 @@ def run_all_filters(df: pd.DataFrame, site_id: str = "") -> pd.DataFrame:
     while True:
         iterations += 1
         cleaned = _apply_filter_stack(df, site_id, threshold, quiet=True, daytime_only=daytime_only)
-        good_days = _count_good_days(df, cleaned.index, daytime_only=daytime_only)
+        good_days = calculator.count_good_days(df, cleaned.index, daytime_only=daytime_only)
         if good_days >= target or threshold >= ceiling or not has_phase:
             break
         threshold = min(round(threshold + step, 10), ceiling)
